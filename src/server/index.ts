@@ -48,7 +48,9 @@ export async function startServer(
 
   // OpenAI-compatible endpoints
   app.get("/", handleRoot);
+  app.post("/", handleRoot);
   app.get("/health", handleHealth);
+  app.post("/health", handleHealth);
   app.get("/v1/models", handleModels);
   app.post("/v1/chat/completions", handleChatCompletions);
 
