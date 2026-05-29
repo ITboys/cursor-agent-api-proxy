@@ -14,3 +14,6 @@ export {
   createDoneChunk,
   createChatResponse,
 } from "./adapter/cli-to-openai.js";
+
+export { AccountsManager, getAccountsManager } from "./account/manager.js";
+export type { AccountConfig, AccountSummary } from "./types/account.js";

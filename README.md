@@ -197,6 +197,87 @@ Client  →  POST /v1/chat/completions (OpenAI format)
         →  AI response → OpenAI format → Client
 ```
 
+## Multi-Account Support
+
+Manage multiple Cursor subscriptions behind a single proxy instance. Select an account via the `X-Cursor-Account` request header.
+
+### Configuring Accounts
+
+**Method 1: Config file (recommended)**
+
+Edit `~/.cursor-agent-api/accounts.json`:
+
+```json
+{
+  "accounts": {
+    "personal": {
+      "name": "Personal Account",
+      "api_key": "sk-xxx",
+      "default": true
+    },
+    "work": {
+      "name": "Work Account",
+      "api_key": "sk-yyy"
+    }
+  },
+  "default": "personal"
+}
+```
+
+- `api_key` is optional. Omit to use `agent login` global auth.
+- `default: true` marks the default account.
+
+**Method 2: REST API**
+
+```bash
+# Add/update an account
+curl -X POST http://localhost:4646/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"id":"personal","name":"Personal Account","api_key":"sk-xxx","default":true}'
+
+# List accounts
+curl http://localhost:4646/v1/accounts
+
+# Delete an account
+curl -X DELETE http://localhost:4646/v1/accounts/personal
+```
+
+### Using Multiple Accounts
+
+Add the `X-Cursor-Account` header to select the account:
+
+```bash
+# Use personal account
+curl -X POST http://localhost:4646/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Cursor-Account: personal" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello!"}]}'
+
+# Use work account
+curl -X POST http://localhost:4646/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Cursor-Account: work" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+### Account Status
+
+```bash
+curl http://localhost:4646/health
+# Response includes an `accounts` field with total count, default, and list.
+```
+
+### API Endpoints Summary
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check (includes account info) |
+| `/v1/models` | GET | List models |
+| `/v1/chat/completions` | POST | Chat completion (supports `stream: true`) |
+| `/v1/accounts` | GET | List all accounts |
+| `/v1/accounts` | POST | Add/update an account |
+| `/v1/accounts/:id` | DELETE | Delete an account |
+
 ## Contributing
 
 ```bash

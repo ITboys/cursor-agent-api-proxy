@@ -1,5 +1,9 @@
 /**
  * API route handlers — OpenAI-compatible endpoints backed by Cursor CLI.
+ *
+ * Multi-account: use `X-Cursor-Account: <id>` header to select which Cursor
+ * subscription to use for each request. Falls back to the default account or
+ * `agent login` global auth when unset.
  */
 
 import type { Request, Response } from "express";
@@ -13,6 +17,7 @@ import {
   createChatResponse,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
+import { getAccountsManager } from "../account/manager.js";
 
 const KNOWN_MODELS = [
   "auto",
@@ -43,7 +48,22 @@ const KNOWN_MODELS = [
   "grok",
 ];
 
-function extractApiKey(req: Request): string | undefined {
+/**
+ * Extract API key from request:
+ * 1. Check X-Cursor-Account header → resolve from accounts file
+ * 2. Fall back to Authorization: Bearer header
+ */
+function resolveApiKey(req: Request): string | undefined {
+  const accountHeader = req.headers["x-cursor-account"];
+  if (accountHeader) {
+    const accountId = Array.isArray(accountHeader) ? accountHeader[0] : accountHeader;
+    const mgr = getAccountsManager();
+    const apiKey = mgr.resolveApiKey(accountId);
+    if (apiKey) return apiKey;
+    // Fall through to Authorization header if account has no api_key
+    // (account is using agent login auth)
+  }
+
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
     const token = auth.slice(7).trim();
@@ -51,7 +71,20 @@ function extractApiKey(req: Request): string | undefined {
       return token;
     }
   }
+
   return undefined;
+}
+
+/**
+ * Resolve account ID for logging/metrics.
+ */
+function resolveAccountId(req: Request): string {
+  const header = req.headers["x-cursor-account"];
+  if (header) return Array.isArray(header) ? header[0] : header;
+
+  const mgr = getAccountsManager();
+  const def = mgr.getDefaultId();
+  return def ?? "default";
 }
 
 export async function handleChatCompletions(
@@ -61,6 +94,7 @@ export async function handleChatCompletions(
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as OpenAIChatRequest;
   const stream = body.stream === true;
+  const accountId = resolveAccountId(req);
 
   try {
     if (
@@ -79,9 +113,9 @@ export async function handleChatCompletions(
     }
 
     const { prompt, model } = openaiToCli(body);
-    const apiKey = extractApiKey(req);
+    const apiKey = resolveApiKey(req);
     console.error(
-      `[chat] id=${requestId} model=${body.model} -> cli_model=${model} stream=${stream}`
+      `[chat] id=${requestId} account=${accountId} model=${body.model} -> cli_model=${model} stream=${stream}`
     );
 
     const subprocess = new CursorSubprocess();
@@ -280,10 +314,111 @@ export function setCachedCliVersion(version: string): void {
 }
 
 export function handleHealth(_req: Request, res: Response): void {
+  const mgr = getAccountsManager();
+  const accounts = mgr.list();
+  const activeAccount = mgr.getDefaultId();
+
   res.json({
     status: "ok",
     provider: "cursor-agent-api-proxy",
     cli_version: cachedCliVersion ?? "unknown",
+    accounts: {
+      total: accounts.length,
+      default: activeAccount ?? "agent-login",
+      list: accounts,
+    },
     timestamp: new Date().toISOString(),
+  });
+}
+
+// ── Account management endpoints ──────────────────────────────────────
+
+/** GET /v1/accounts — list all configured accounts */
+export function handleListAccounts(_req: Request, res: Response): void {
+  const mgr = getAccountsManager();
+  res.json({
+    object: "list",
+    data: mgr.list(),
+  });
+}
+
+/** POST /v1/accounts — add or update an account */
+export function handleUpsertAccount(req: Request, res: Response): void {
+  const { id, ...config } = req.body;
+
+  if (!id || typeof id !== "string" || !id.trim()) {
+    res.status(400).json({
+      error: {
+        message: "Account 'id' is required and must be a non-empty string",
+        type: "invalid_request_error",
+        code: "invalid_account_id",
+      },
+    });
+    return;
+  }
+
+  if (!config.name || typeof config.name !== "string") {
+    res.status(400).json({
+      error: {
+        message: "Account 'name' is required",
+        type: "invalid_request_error",
+        code: "invalid_account_name",
+      },
+    });
+    return;
+  }
+
+  const mgr = getAccountsManager();
+  mgr.set(id.trim(), {
+    name: config.name,
+    api_key: config.api_key,
+    default: config.default === true,
+    models: Array.isArray(config.models) ? config.models : undefined,
+  });
+
+  res.status(200).json({
+    object: "account",
+    id: id.trim(),
+    name: config.name,
+    default: config.default === true || id.trim() === mgr.getDefaultId(),
+    hasApiKey: !!config.api_key,
+    modelCount: Array.isArray(config.models) ? config.models.length : null,
+    message: `Account '${id.trim()}' saved.`,
+  });
+}
+
+/** DELETE /v1/accounts/:id — remove an account */
+export function handleDeleteAccount(req: Request, res: Response): void {
+  const idRaw = req.params.id;
+  const id = Array.isArray(idRaw) ? idRaw[0] : idRaw;
+  if (!id) {
+    res.status(400).json({
+      error: {
+        message: "Account id is required",
+        type: "invalid_request_error",
+        code: "missing_account_id",
+      },
+    });
+    return;
+  }
+
+  const mgr = getAccountsManager();
+  if (!mgr.get(id)) {
+    res.status(404).json({
+      error: {
+        message: `Account '${id}' not found`,
+        type: "invalid_request_error",
+        code: "account_not_found",
+      },
+    });
+    return;
+  }
+
+  mgr.remove(id);
+  res.json({
+    object: "account",
+    id,
+    deleted: true,
+    message: `Account '${id}' removed.`,
   });
 }

@@ -8,7 +8,11 @@ import {
   handleChatCompletions,
   handleModels,
   handleHealth,
+  handleListAccounts,
+  handleUpsertAccount,
+  handleDeleteAccount,
 } from "./routes.js";
+import { getAccountsManager } from "../account/manager.js";
 
 let server: Server | null = null;
 
@@ -28,11 +32,11 @@ export async function startServer(
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader(
       "Access-Control-Allow-Methods",
-      "GET, POST, OPTIONS"
+      "GET, POST, OPTIONS, DELETE"
     );
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, Authorization"
+      "Content-Type, Authorization, X-Cursor-Account"
     );
     next();
   });
@@ -41,9 +45,15 @@ export async function startServer(
     res.sendStatus(204);
   });
 
+  // OpenAI-compatible endpoints
   app.get("/health", handleHealth);
   app.get("/v1/models", handleModels);
   app.post("/v1/chat/completions", handleChatCompletions);
+
+  // Account management endpoints
+  app.get("/v1/accounts", handleListAccounts);
+  app.post("/v1/accounts", handleUpsertAccount);
+  app.delete("/v1/accounts/:id", handleDeleteAccount);
 
   app.use((_req, res) => {
     res.status(404).json({
@@ -57,7 +67,11 @@ export async function startServer(
 
   return new Promise((resolve, reject) => {
     server = app.listen(port, () => {
-      console.log(`Server listening on http://localhost:${port}`);
+      const mgr = getAccountsManager(); // lazy init
+      console.error(`Server listening on http://localhost:${port}`);
+      console.error(
+        `  Accounts: ${mgr.list().length} configured (default: ${mgr.getDefaultId() ?? "agent-login"})`
+      );
       resolve(server!);
     });
     server.on("error", reject);

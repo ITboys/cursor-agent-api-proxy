@@ -25,6 +25,7 @@ import {
   registerForegroundPid,
   clearPidFile,
 } from "../service/daemon.js";
+import { getAccountsManager } from "../account/manager.js";
 
 const DEFAULT_PORT = 4646;
 
@@ -50,6 +51,11 @@ Commands:
   install         Register as auto-start service (LaunchAgent / schtasks / systemd)
   uninstall       Remove auto-start service
 
+Accounts:
+  Configured in ~/.cursor-agent-api/accounts.json
+  Or use REST API: POST /v1/accounts, GET /v1/accounts, DELETE /v1/accounts/:id
+  Request header: X-Cursor-Account: <account-id>
+
 Options:
   [port]          Listen port (default: 4646, or $PORT)
   -h, --help      Show this help`);
@@ -74,13 +80,26 @@ async function runForeground(port: number): Promise<void> {
     process.exit(1);
   }
 
+  // Show multi-account info
+  const mgr = getAccountsManager();
+  if (mgr.hasAccounts()) {
+    console.log(`  Accounts: ${mgr.list().length} configured`);
+    for (const a of mgr.list()) {
+      console.log(`    ${a.default ? "* " : "  "}${a.id} (${a.name})`);
+    }
+  } else {
+    console.log("  Accounts: none configured (using agent login or CURSOR_API_KEY)");
+  }
+
   try {
     await startServer({ port });
     registerForegroundPid();
     const base = `http://localhost:${port}`;
     console.log(`\n  Base URL : ${base}/v1`);
     console.log(`  Health   : ${base}/health`);
-    console.log("\n  Press Ctrl+C to stop.\n");
+    console.log(`  Accounts : ${base}/v1/accounts`);
+    console.log("\n  Headers for multi-account: X-Cursor-Account: <account-id>");
+    console.log("  Press Ctrl+C to stop.\n");
   } catch (err) {
     console.error("Failed to start server:", err);
     process.exit(1);

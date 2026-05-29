@@ -197,6 +197,87 @@ curl -X POST http://localhost:4646/v1/chat/completions \
         →  AI 响应 → OpenAI 格式 → 客户端
 ```
 
+## 多账号管理
+
+支持在同一代理下管理多个 Cursor 订阅账号，通过请求头 `X-Cursor-Account` 选择使用的账号。
+
+### 配置账号
+
+**方式一：配置文件（推荐）**
+
+编辑 `~/.cursor-agent-api/accounts.json`：
+
+```json
+{
+  "accounts": {
+    "personal": {
+      "name": "个人账号",
+      "api_key": "sk-xxx",
+      "default": true
+    },
+    "work": {
+      "name": "工作账号",
+      "api_key": "sk-yyy"
+    }
+  },
+  "default": "personal"
+}
+```
+
+- `api_key` 可选。不填则使用 `agent login` 全局认证
+- `default: true` 标记为默认账号
+
+**方式二：REST API**
+
+```bash
+# 添加/更新账号
+curl -X POST http://localhost:4646/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"id":"personal","name":"个人账号","api_key":"sk-xxx","default":true}'
+
+# 列出账号
+curl http://localhost:4646/v1/accounts
+
+# 删除账号
+curl -X DELETE http://localhost:4646/v1/accounts/personal
+```
+
+### 使用多账号
+
+在请求中添加 `X-Cursor-Account` 头指定使用哪个账号：
+
+```bash
+# 使用个人账号
+curl -X POST http://localhost:4646/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Cursor-Account: personal" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello!"}]}'
+
+# 使用工作账号
+curl -X POST http://localhost:4646/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Cursor-Account: work" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+### 查询账号状态
+
+```bash
+curl http://localhost:4646/health
+# 返回中会显示 accounts 字段，包含总账号数、默认账号和列表
+```
+
+### REST API 端点汇总
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查（含账号信息） |
+| `/v1/models` | GET | 模型列表 |
+| `/v1/chat/completions` | POST | 聊天补全（支持 `stream: true`） |
+| `/v1/accounts` | GET | 列出所有账号 |
+| `/v1/accounts` | POST | 添加/更新账号 |
+| `/v1/accounts/:id` | DELETE | 删除账号 |
+
 ## 参与开发
 
 ```bash
