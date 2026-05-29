@@ -313,6 +313,15 @@ export function setCachedCliVersion(version: string): void {
   cachedCliVersion = version;
 }
 
+/** GET / — root welcome, helps new-api / one-api channel tests pass */
+export function handleRoot(_req: Request, res: Response): void {
+  res.json({
+    status: "ok",
+    provider: "cursor-agent-api-proxy",
+    message: "Cursor CLI → OpenAI-compatible API proxy. Use /v1/chat/completions, /v1/models, /v1/accounts.",
+  });
+}
+
 export function handleHealth(_req: Request, res: Response): void {
   const mgr = getAccountsManager();
   const accounts = mgr.list();
