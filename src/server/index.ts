@@ -9,11 +9,13 @@ import {
   handleModels,
   handleHealth,
   handleRoot,
+  handlePostRoot,
   handleListAccounts,
   handleUpsertAccount,
   handleDeleteAccount,
 } from "./routes.js";
 import { getAccountsManager } from "../account/manager.js";
+import { getPool } from "../subprocess/pool.js";
 
 let server: Server | null = null;
 
@@ -48,7 +50,7 @@ export async function startServer(
 
   // OpenAI-compatible endpoints
   app.get("/", handleRoot);
-  app.post("/", handleRoot);
+  app.post("/", handlePostRoot);
   app.get("/health", handleHealth);
   app.post("/health", handleHealth);
   app.get("/v1/models", handleModels);
@@ -70,12 +72,25 @@ export async function startServer(
   });
 
   return new Promise((resolve, reject) => {
-    server = app.listen(port, () => {
+    server = app.listen(port, async () => {
       const mgr = getAccountsManager(); // lazy init
       console.error(`Server listening on http://localhost:${port}`);
       console.error(
         `  Accounts: ${mgr.list().length} configured (default: ${mgr.getDefaultId() ?? "agent-login"})`
       );
+
+      // Pre-warm process pool for all configured accounts.
+      // Waits for all agent CLI processes to spawn (~5-15s for first time).
+      // Subsequent requests skip CLI startup entirely.
+      await getPool().prewarmAll();
+      const poolStats = getPool().stats();
+      const warmCount = Object.values(poolStats).reduce((s, e) => s + e.warm, 0);
+      if (warmCount > 0) {
+        console.error(`  Pool: ${warmCount} warm process(es) spawned and ready`);
+      } else {
+        console.error(`  Pool: no accounts with API keys — skipping`);
+      }
+
       resolve(server!);
     });
     server.on("error", reject);
@@ -83,6 +98,9 @@ export async function startServer(
 }
 
 export async function stopServer(): Promise<void> {
+  // Shut down process pool first (kills warm agent processes)
+  getPool().shutdown();
+
   if (server) {
     return new Promise((resolve) => {
       server!.close(() => {

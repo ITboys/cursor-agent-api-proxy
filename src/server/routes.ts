@@ -10,6 +10,7 @@ import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { CursorSubprocess } from "../subprocess/manager.js";
 import type { ContentDeltaEvent, ResultEvent } from "../subprocess/manager.js";
+import { getPool } from "../subprocess/pool.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   createStreamChunk,
@@ -51,25 +52,37 @@ const KNOWN_MODELS = [
 /**
  * Extract API key from request:
  * 1. Check X-Cursor-Account header → resolve from accounts file
- * 2. Fall back to Authorization: Bearer header
+ * 2. Check Authorization: Bearer *** (for direct client calls)
+ * 3. Fall back to default account's api_key (when accounts are configured)
  */
 function resolveApiKey(req: Request): string | undefined {
+  const mgr = getAccountsManager();
+
+  // 1. Explicit account selection via header
   const accountHeader = req.headers["x-cursor-account"];
   if (accountHeader) {
     const accountId = Array.isArray(accountHeader) ? accountHeader[0] : accountHeader;
-    const mgr = getAccountsManager();
     const apiKey = mgr.resolveApiKey(accountId);
     if (apiKey) return apiKey;
-    // Fall through to Authorization header if account has no api_key
-    // (account is using agent login auth)
+    // Fall through if account has no api_key (uses agent login auth)
   }
 
+  // 2. Check Authorization header (direct client calls)
+  // Only accept tokens that look like Cursor API keys (crsr_ prefix)
+  // so new-api/one-api internal tokens don't get passed to Cursor CLI as API keys.
+  // When accounts are configured, the fallback (step 3) will use the default account key.
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
     const token = auth.slice(7).trim();
-    if (token && token !== "not-needed" && token !== "no-key" && token !== "null") {
+    if (token && token.startsWith("crsr_")) {
       return token;
     }
+  }
+
+  // 3. Fall back to default account's api_key (for proxy scenarios like new-api)
+  if (mgr.hasAccounts()) {
+    const defaultKey = mgr.resolveApiKey(); // no arg = default account
+    if (defaultKey) return defaultKey;
   }
 
   return undefined;
@@ -93,7 +106,9 @@ export async function handleChatCompletions(
 ): Promise<void> {
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as OpenAIChatRequest;
-  const stream = body.stream === true;
+  // Always use streaming internally for fast first-token delivery.
+  // Non-streaming requests aggregate the stream and return JSON.
+  const clientWantsStream = body.stream === true;
   const accountId = resolveAccountId(req);
 
   try {
@@ -115,12 +130,13 @@ export async function handleChatCompletions(
     const { prompt, model } = openaiToCli(body);
     const apiKey = resolveApiKey(req);
     console.error(
-      `[chat] id=${requestId} account=${accountId} model=${body.model} -> cli_model=${model} stream=${stream}`
+      `[chat] id=${requestId} account=${accountId} model=${body.model} -> cli_model=${model} client_stream=${clientWantsStream}`
     );
 
-    const subprocess = new CursorSubprocess();
+    // Acquire a subprocess from the pool (warm or cold)
+    const { subprocess } = await getPool().acquire(accountId, apiKey);
 
-    if (stream) {
+    if (clientWantsStream) {
       await handleStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
     } else {
       await handleNonStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
@@ -322,6 +338,27 @@ export function handleRoot(_req: Request, res: Response): void {
   });
 }
 
+/**
+ * POST / — some API gateways (new-api/one-api with type=8 custom channel)
+ * only POST to the base_url root, stripping the original request path.
+ * If the body has messages, route to chat completions; otherwise welcome.
+ */
+export async function handlePostRoot(req: Request, res: Response): Promise<void> {
+  const body = req.body as Record<string, unknown> | undefined;
+  const hasMessages =
+    body &&
+    Array.isArray(body.messages) &&
+    body.messages.length > 0 &&
+    body.model;
+
+  if (hasMessages) {
+    await handleChatCompletions(req, res);
+    return;
+  }
+
+  handleRoot(req, res);
+}
+
 export function handleHealth(_req: Request, res: Response): void {
   const mgr = getAccountsManager();
   const accounts = mgr.list();
@@ -336,6 +373,7 @@ export function handleHealth(_req: Request, res: Response): void {
       default: activeAccount ?? "agent-login",
       list: accounts,
     },
+    pool: getPool().stats(),
     timestamp: new Date().toISOString(),
   });
 }

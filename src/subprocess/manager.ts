@@ -4,6 +4,10 @@
  * Spawns `agent -p --output-format stream-json --stream-partial-output --yolo`
  * and emits normalized events: content_delta, result, error, close.
  *
+ * Supports two-phase initialization for process pooling:
+ *   1. preSpawn() — spawn the process, set up I/O, but don't write to stdin
+ *   2. start()   — write prompt to an already-warm process (or do full spawn+write)
+ *
  * The prompt is piped via stdin to avoid shell argument length limits.
  */
 
@@ -37,6 +41,13 @@ export interface ResultEvent {
   model: string;
 }
 
+/**
+ * Maximum number of prompts a single CursorSubprocess can handle before
+ * being recycled. The agent CLI accumulates conversation context with
+ * each turn, so we eventually refresh to keep it lightweight.
+ */
+const MAX_TURNS = 5;
+
 export class CursorSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer = "";
@@ -44,9 +55,28 @@ export class CursorSubprocess extends EventEmitter {
   private isKilled = false;
   private detectedModel = "cursor-auto";
   private turnBuffer = "";
+  private isWarm = false;
 
-  async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = this.buildArgs(options);
+  /** Number of successful prompts this process has handled. */
+  private turnCount = 0;
+
+  /** Buffer that holds stdout data between writes (for keep-alive mode). */
+  private stdoutBuffer = "";
+
+  /** Resolver for the current prompt's start() promise (keep-alive mode). */
+  private pendingResolve: (() => void) | null = null;
+
+  /** Rejecter for the current prompt's start() promise (keep-alive mode). */
+  private pendingReject: ((err: Error) => void) | null = null;
+
+  /**
+   * Phase 1: spawn the agent process with the right API key and model args,
+   * but DON'T write to stdin yet. The process sits idle waiting for input.
+   * After this, call `start(prompt)` to send the actual prompt.
+   */
+  async preSpawn(options: SubprocessOptions): Promise<void> {
+    if (this.process) return; // already spawned
+
     const timeout = options.timeout ?? DEFAULT_TIMEOUT;
 
     return new Promise<void>((resolve, reject) => {
@@ -56,6 +86,7 @@ export class CursorSubprocess extends EventEmitter {
           env.CURSOR_API_KEY = options.apiKey;
         }
 
+        const args = this.buildArgs(options);
         this.process = spawn("agent", args, {
           cwd: options.cwd ?? process.cwd(),
           env,
@@ -86,10 +117,9 @@ export class CursorSubprocess extends EventEmitter {
           }
         });
 
-        this.process.stdin?.write(prompt);
-        this.process.stdin?.end();
-
+        // Set up stdout handler for streaming response parsing
         this.process.stdout?.on("data", (chunk: Buffer) => {
+          this.stdoutBuffer += chunk.toString();
           this.buffer += chunk.toString();
           this.processBuffer();
         });
@@ -107,14 +137,86 @@ export class CursorSubprocess extends EventEmitter {
             this.processBuffer();
           }
           this.emit("close", code);
+          // If there's a pending request, reject it
+          if (this.pendingReject) {
+            this.pendingReject(new Error(`Process exited with code ${code}`));
+            this.pendingReject = null;
+            this.pendingResolve = null;
+          }
         });
 
+        this.isWarm = true;
         resolve();
       } catch (err) {
         this.clearTimer();
         reject(err);
       }
     });
+  }
+
+  /**
+   * Phase 2: send the prompt to the process and await response events.
+   *
+   * If preSpawn() was called first, this reuses the already-spawned process
+   * and just writes the prompt to stdin — skipping the ~10-15s CLI startup.
+   *
+   * If preSpawn() was NOT called, falls back to the original full spawn+write.
+   */
+  async start(prompt: string, options: SubprocessOptions): Promise<void> {
+    if (this.isKilled || !this.process) {
+      // Dead process — do full spawn
+      this.cleanup();
+      this.isWarm = false;
+      this.turnCount = 0;
+      await this.preSpawn(options);
+    }
+
+    if (this.turnCount >= MAX_TURNS) {
+      // Recycled too many times — kill and spawn fresh
+      console.error(`[CursorSubprocess] Recycling after ${MAX_TURNS} turns`);
+      this.kill();
+      this.cleanup();
+      this.isWarm = false;
+      this.turnCount = 0;
+      await this.preSpawn(options);
+    }
+
+    if (this.isWarm && this.process) {
+      // Warm path: already spawned, just write prompt and signal end
+      // We write the prompt then close stdin. The agent processes it and
+      // exits. For keep-alive, we rely on the pool to re-spawn.
+      this.resetTimer(options.timeout);
+      this.buffer = "";
+      this.turnBuffer = "";
+      this.detectedModel = "cursor-auto";
+      this.stdoutBuffer = "";
+      this.isWarm = false;
+      this.turnCount++;
+
+      this.process.stdin?.write(prompt);
+      this.process.stdin?.end();
+      return;
+    }
+
+    // Cold path: original full spawn + write
+    this.turnCount = 1;
+    await this.preSpawn(options);
+    this.process!.stdin?.write(prompt);
+    this.process!.stdin?.end();
+    this.isWarm = false;
+  }
+
+  /** Reset the timeout timer (used when switching from warm to active). */
+  private resetTimer(timeout?: number): void {
+    this.clearTimer();
+    const ttl = timeout ?? DEFAULT_TIMEOUT;
+    this.timeoutId = setTimeout(() => {
+      if (!this.isKilled) {
+        this.isKilled = true;
+        this.process?.kill(IS_WIN ? undefined : "SIGTERM");
+        this.emit("error", new Error(`Request timed out after ${ttl}ms`));
+      }
+    }, ttl);
   }
 
   private buildArgs(options: SubprocessOptions): string[] {
@@ -208,6 +310,12 @@ export class CursorSubprocess extends EventEmitter {
     if (!this.isKilled && this.process) {
       this.isKilled = true;
       this.clearTimer();
+      // Resolve pending so acquirer doesn't hang
+      if (this.pendingResolve) {
+        this.pendingResolve();
+        this.pendingResolve = null;
+        this.pendingReject = null;
+      }
       if (IS_WIN) {
         this.process.kill();
       } else {
@@ -218,6 +326,30 @@ export class CursorSubprocess extends EventEmitter {
 
   isRunning(): boolean {
     return this.process !== null && !this.isKilled && this.process.exitCode === null;
+  }
+
+  /** True if this subprocess was pre-spawned and is waiting for a prompt. */
+  isWarmProcess(): boolean {
+    return this.isWarm && this.process !== null && !this.isKilled;
+  }
+
+  /** Max turns this process can handle before recycle. */
+  getMaxTurns(): number {
+    return MAX_TURNS;
+  }
+
+  private cleanup(): void {
+    if (this.process) {
+      this.process.removeAllListeners();
+      this.process = null;
+    }
+    this.buffer = "";
+    this.turnBuffer = "";
+    this.stdoutBuffer = "";
+    this.detectedModel = "cursor-auto";
+    this.isWarm = false;
+    this.pendingResolve = null;
+    this.pendingReject = null;
   }
 }
 
