@@ -23,6 +23,8 @@ import { getAccountsManager } from "../account/manager.js";
 interface PoolEntry {
   /** Queue of warm subprocesses ready to accept a prompt. */
   queue: CursorSubprocess[];
+  /** In-flight spawn count — prevents over/under refill under burst load. */
+  spawning: number;
 }
 
 /**
@@ -42,8 +44,11 @@ export class SubprocessPool {
   private idleTimer: NodeJS.Timeout | null = null;
   private readonly IDLE_TTL = 5 * 60 * 1000; // 5 min — kill warm processes that never got used
   private readonly PREWARM_MODEL = "auto";
-  /** Target warm processes to maintain per account. */
-  private readonly TARGET_SIZE = 2;
+  /** Target warm processes to maintain per account (override via CURSOR_POOL_SIZE). */
+  private readonly TARGET_SIZE = Math.max(
+    1,
+    parseInt(process.env.CURSOR_POOL_SIZE ?? "3", 10) || 3
+  );
 
   /**
    * Pre-warm all configured accounts.
@@ -59,13 +64,23 @@ export class SubprocessPool {
       return;
     }
 
+    const instanceAccount = process.env.CURSOR_INSTANCE_ACCOUNT;
+    const accountsToWarm = instanceAccount
+      ? accounts.filter((a) => a.id === instanceAccount)
+      : accounts;
+
+    if (accountsToWarm.length === 0) {
+      console.error(`[Pool] No accounts to pre-warm`);
+      return;
+    }
+
     console.error(
-      `[Pool] Pre-warming ${accounts.length} account(s) x ${this.TARGET_SIZE} processes... (this may take 10-30s)`
+      `[Pool] Pre-warming ${accountsToWarm.length} account(s) x ${this.TARGET_SIZE} processes... (this may take 10-30s)`
     );
 
     // Spawn TARGET_SIZE processes per account
     const promises: Promise<void>[] = [];
-    for (const account of accounts) {
+    for (const account of accountsToWarm) {
       const apiKey = mgr.resolveApiKey(account.id);
       if (!apiKey) continue;
       for (let i = 0; i < this.TARGET_SIZE; i++) {
@@ -113,7 +128,7 @@ export class SubprocessPool {
 
     // Ensure entry exists for future refilling
     if (!entry) {
-      entry = { queue: [] };
+      entry = { queue: [], spawning: 0 };
       this.pools.set(accountId, entry);
     }
 
@@ -128,12 +143,19 @@ export class SubprocessPool {
    * Runs asynchronously — doesn't block the caller.
    */
   private refill(accountId: string, apiKey?: string): void {
-    const entry = this.pools.get(accountId);
-    if (!entry) return;
+    let entry = this.pools.get(accountId);
+    if (!entry) {
+      entry = { queue: [], spawning: 0 };
+      this.pools.set(accountId, entry);
+    }
 
-    const needed = this.TARGET_SIZE - entry.queue.length;
+    const needed = this.TARGET_SIZE - entry.queue.length - entry.spawning;
     for (let i = 0; i < needed; i++) {
-      this.spawnWarm(accountId, apiKey);
+      entry.spawning++;
+      this.spawnWarm(accountId, apiKey).finally(() => {
+        const e = this.pools.get(accountId);
+        if (e) e.spawning = Math.max(0, e.spawning - 1);
+      });
     }
   }
 
@@ -157,7 +179,7 @@ export class SubprocessPool {
 
       let entry = this.pools.get(accountId);
       if (!entry) {
-        entry = { queue: [] };
+        entry = { queue: [], spawning: 0 };
         this.pools.set(accountId, entry);
       }
 
@@ -201,11 +223,12 @@ export class SubprocessPool {
   }
 
   /** Get pool stats for health check / monitoring. */
-  stats(): Record<string, { warm: number; targetSize: number }> {
-    const stats: Record<string, { warm: number; targetSize: number }> = {};
+  stats(): Record<string, { warm: number; spawning: number; targetSize: number }> {
+    const stats: Record<string, { warm: number; spawning: number; targetSize: number }> = {};
     for (const [id, entry] of this.pools) {
       stats[id] = {
         warm: entry.queue.length,
+        spawning: entry.spawning,
         targetSize: this.TARGET_SIZE,
       };
     }

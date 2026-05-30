@@ -20,6 +20,9 @@ import {
 import type { OpenAIChatRequest } from "../types/openai.js";
 import { getAccountsManager } from "../account/manager.js";
 
+/** Multi-instance mode: bind this process to a single account (set by manager script). */
+const INSTANCE_ACCOUNT = process.env.CURSOR_INSTANCE_ACCOUNT;
+
 const KNOWN_MODELS = [
   "auto",
   "composer-1.5",
@@ -79,13 +82,20 @@ function resolveApiKey(req: Request): string | undefined {
     }
   }
 
-  // 3. Fall back to default account's api_key (for proxy scenarios like new-api)
+  // 3. Multi-instance binding (one port = one account)
+  if (INSTANCE_ACCOUNT) {
+    const instanceKey =
+      mgr.resolveApiKey(INSTANCE_ACCOUNT) ?? process.env.CURSOR_API_KEY;
+    if (instanceKey) return instanceKey;
+  }
+
+  // 4. Fall back to default account's api_key (for proxy scenarios like new-api)
   if (mgr.hasAccounts()) {
     const defaultKey = mgr.resolveApiKey(); // no arg = default account
     if (defaultKey) return defaultKey;
   }
 
-  return undefined;
+  return process.env.CURSOR_API_KEY;
 }
 
 /**
@@ -94,6 +104,8 @@ function resolveApiKey(req: Request): string | undefined {
 function resolveAccountId(req: Request): string {
   const header = req.headers["x-cursor-account"];
   if (header) return Array.isArray(header) ? header[0] : header;
+
+  if (INSTANCE_ACCOUNT) return INSTANCE_ACCOUNT;
 
   const mgr = getAccountsManager();
   const def = mgr.getDefaultId();
@@ -106,9 +118,8 @@ export async function handleChatCompletions(
 ): Promise<void> {
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
   const body = req.body as OpenAIChatRequest;
-  // Always use streaming internally for fast first-token delivery.
-  // Non-streaming requests aggregate the stream and return JSON.
-  const clientWantsStream = body.stream === true;
+  // Default to streaming for faster first-byte delivery (OpenAI SDK default is false).
+  const clientWantsStream = body.stream !== false;
   const accountId = resolveAccountId(req);
 
   try {
@@ -257,8 +268,35 @@ async function handleNonStreamingResponse(
   requestId: string,
   apiKey?: string
 ): Promise<void> {
+  // Flush headers immediately so clients (new-api, curl) see TTFB ~ms not ~10s.
+  res.status(200);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("X-Request-Id", requestId);
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const sendJson = (status: number, body: unknown): void => {
+    if (res.writableEnded) return;
+    if (!res.headersSent) {
+      res.status(status).json(body);
+      return;
+    }
+    // Headers already flushed — write body only (cannot call res.json/setHeader again).
+    if (status !== 200) {
+      console.error("[non-stream] Error after headers flushed:", body);
+    }
+    res.write(JSON.stringify(body));
+    res.end();
+  };
+
   return new Promise<void>((resolve) => {
     let finalResult: ResultEvent | null = null;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
 
     subprocess.on("result", (result: ResultEvent) => {
       finalResult = result;
@@ -266,12 +304,10 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[non-stream] Error:", error.message);
-      if (!res.headersSent) {
-        res.status(500).json({
-          error: { message: error.message, type: "server_error", code: null },
-        });
-      }
-      resolve();
+      sendJson(500, {
+        error: { message: error.message, type: "server_error", code: null },
+      });
+      finish();
     });
 
     subprocess.on("close", () => {
@@ -281,9 +317,9 @@ async function handleNonStreamingResponse(
           finalResult.model || model,
           finalResult.text
         );
-        res.json(response);
-      } else if (!res.headersSent) {
-        res.status(500).json({
+        sendJson(200, response);
+      } else if (!settled) {
+        sendJson(500, {
           error: {
             message: "CLI exited without producing a result",
             type: "server_error",
@@ -291,20 +327,18 @@ async function handleNonStreamingResponse(
           },
         });
       }
-      resolve();
+      finish();
     });
 
     subprocess.start(prompt, { model, apiKey }).catch((error) => {
-      if (!res.headersSent) {
-        res.status(500).json({
-          error: {
-            message: error instanceof Error ? error.message : String(error),
-            type: "server_error",
-            code: null,
-          },
-        });
-      }
-      resolve();
+      sendJson(500, {
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          type: "server_error",
+          code: null,
+        },
+      });
+      finish();
     });
   });
 }
@@ -361,18 +395,28 @@ export async function handlePostRoot(req: Request, res: Response): Promise<void>
 
 export function handleHealth(_req: Request, res: Response): void {
   const mgr = getAccountsManager();
-  const accounts = mgr.list();
-  const activeAccount = mgr.getDefaultId();
+  const activeAccount = INSTANCE_ACCOUNT ?? mgr.getDefaultId();
+  const activeId = activeAccount ?? "agent-login";
+  const accounts = mgr.list(activeAccount);
+
+  const accountsBlock: Record<string, unknown> = {
+    total: accounts.length,
+    list: accounts,
+  };
+  // Multi-instance: one field for runtime binding; file-level default is separate.
+  if (INSTANCE_ACCOUNT) {
+    accountsBlock.config_default = mgr.getDefaultId();
+  } else {
+    accountsBlock.default = activeId;
+  }
 
   res.json({
     status: "ok",
     provider: "cursor-agent-api-proxy",
     cli_version: cachedCliVersion ?? "unknown",
-    accounts: {
-      total: accounts.length,
-      default: activeAccount ?? "agent-login",
-      list: accounts,
-    },
+    active_account: activeId,
+    instance_account: INSTANCE_ACCOUNT ?? null,
+    accounts: accountsBlock,
     pool: getPool().stats(),
     timestamp: new Date().toISOString(),
   });

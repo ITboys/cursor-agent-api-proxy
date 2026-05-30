@@ -93,7 +93,10 @@ async function runForeground(port: number): Promise<void> {
 
   try {
     await startServer({ port });
-    registerForegroundPid();
+    // Multi-instance mode: skip global PID file (each instance has its own pid file).
+    if (!process.env.CURSOR_INSTANCE_ACCOUNT) {
+      registerForegroundPid();
+    }
     const base = `http://localhost:${port}`;
     console.log(`\n  Base URL : ${base}/v1`);
     console.log(`  Health   : ${base}/health`);

@@ -79,17 +79,17 @@ export async function startServer(
         `  Accounts: ${mgr.list().length} configured (default: ${mgr.getDefaultId() ?? "agent-login"})`
       );
 
-      // Pre-warm process pool for all configured accounts.
-      // Waits for all agent CLI processes to spawn (~5-15s for first time).
-      // Subsequent requests skip CLI startup entirely.
-      await getPool().prewarmAll();
-      const poolStats = getPool().stats();
-      const warmCount = Object.values(poolStats).reduce((s, e) => s + e.warm, 0);
-      if (warmCount > 0) {
-        console.error(`  Pool: ${warmCount} warm process(es) spawned and ready`);
-      } else {
-        console.error(`  Pool: no accounts with API keys — skipping`);
-      }
+      // Pre-warm process pool in background — don't block server ready.
+      // Requests can be served immediately; pool fills over the next ~10-30s.
+      void getPool().prewarmAll().then(() => {
+        const poolStats = getPool().stats();
+        const warmCount = Object.values(poolStats).reduce((s, e) => s + e.warm, 0);
+        if (warmCount > 0) {
+          console.error(`  Pool: ${warmCount} warm process(es) spawned and ready`);
+        } else {
+          console.error(`  Pool: no accounts with API keys — skipping`);
+        }
+      });
 
       resolve(server!);
     });

@@ -90,12 +90,16 @@ export class AccountsManager {
     return null;
   }
 
-  /** List all accounts as summaries (safe for API responses). */
-  list(): AccountSummary[] {
+  /**
+   * List all accounts as summaries (safe for API responses).
+   * @param activeId When set (e.g. CURSOR_INSTANCE_ACCOUNT), marks that id as default in the list.
+   */
+  list(activeId?: string | null): AccountSummary[] {
+    const effectiveDefault = activeId ?? this.defaultId;
     return Object.entries(this.accounts).map(([id, config]) => ({
       id,
       name: config.name,
-      default: id === this.defaultId,
+      default: effectiveDefault ? id === effectiveDefault : false,
       hasApiKey: !!config.api_key,
       modelCount: config.models ? config.models.length : null,
     }));
