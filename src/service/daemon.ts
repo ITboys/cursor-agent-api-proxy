@@ -19,8 +19,16 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 
 const STATE_DIR = join(homedir(), ".cursor-agent-api");
-const PID_FILE = join(STATE_DIR, "pid");
 const LOG_FILE = join(STATE_DIR, "server.log");
+
+/** Per-instance PID when CURSOR_INSTANCE_ACCOUNT is set; else global singleton pid. */
+function getPidFile(): string {
+  const account = process.env.CURSOR_INSTANCE_ACCOUNT;
+  if (account) {
+    return join(STATE_DIR, `pid-${account}.pid`);
+  }
+  return join(STATE_DIR, "pid");
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -34,8 +42,9 @@ function ensureStateDir(): void {
 }
 
 function readPid(): number | null {
-  if (!existsSync(PID_FILE)) return null;
-  const raw = readFileSync(PID_FILE, "utf-8").trim();
+  const pidFile = getPidFile();
+  if (!existsSync(pidFile)) return null;
+  const raw = readFileSync(pidFile, "utf-8").trim();
   const pid = parseInt(raw, 10);
   return isNaN(pid) ? null : pid;
 }
@@ -51,14 +60,14 @@ function isRunning(pid: number): boolean {
 
 function removePidFile(): void {
   try {
-    unlinkSync(PID_FILE);
+    unlinkSync(getPidFile());
   } catch {}
 }
 
 /** Foreground server (e.g. systemd / run) — enables status/stop to find this process. */
 export function registerForegroundPid(): void {
   ensureStateDir();
-  writeFileSync(PID_FILE, String(process.pid));
+  writeFileSync(getPidFile(), String(process.pid));
 }
 
 export function daemonStatus(): void {
@@ -139,7 +148,7 @@ export function daemonStart(port?: number): void {
     process.exit(1);
   }
 
-  writeFileSync(PID_FILE, String(child.pid));
+  writeFileSync(getPidFile(), String(child.pid));
   child.unref();
 
   const base = `http://localhost:${listenPort}`;

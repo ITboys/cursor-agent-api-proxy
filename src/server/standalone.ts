@@ -93,10 +93,8 @@ async function runForeground(port: number): Promise<void> {
 
   try {
     await startServer({ port });
-    // Multi-instance mode: skip global PID file (each instance has its own pid file).
-    if (!process.env.CURSOR_INSTANCE_ACCOUNT) {
-      registerForegroundPid();
-    }
+    // Writes ~/.cursor-agent-api/pid or pid-<account>.pid (multi-instance).
+    registerForegroundPid();
     const base = `http://localhost:${port}`;
     console.log(`\n  Base URL : ${base}/v1`);
     console.log(`  Health   : ${base}/health`);
@@ -117,6 +115,11 @@ async function runForeground(port: number): Promise<void> {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+
+  // Prevent a single bad HTTP response from taking down the whole instance.
+  process.on("uncaughtException", (err) => {
+    console.error("[fatal] Uncaught exception (server stays up):", err);
+  });
 }
 
 async function main(): Promise<void> {

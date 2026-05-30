@@ -183,10 +183,16 @@ async function handleStreamingResponse(
     let isFirst = true;
     let lastModel = model;
     let isComplete = false;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
 
     res.on("close", () => {
       if (!isComplete) subprocess.kill();
-      resolve();
+      finish();
     });
 
     subprocess.on("content_delta", (delta: ContentDeltaEvent) => {
@@ -197,7 +203,7 @@ async function handleStreamingResponse(
       }
     });
 
-    subprocess.on("result", (result: ResultEvent) => {
+    subprocess.once("result", (result: ResultEvent) => {
       isComplete = true;
       if (result.model) lastModel = result.model;
       if (!res.writableEnded) {
@@ -206,10 +212,10 @@ async function handleStreamingResponse(
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      finish();
     });
 
-    subprocess.on("error", (error: Error) => {
+    subprocess.once("error", (error: Error) => {
       console.error("[stream] Error:", error.message);
       if (!res.writableEnded) {
         res.write(
@@ -219,12 +225,12 @@ async function handleStreamingResponse(
         );
         res.end();
       }
-      resolve();
+      finish();
     });
 
-    subprocess.on("close", (code: number | null) => {
-      if (!res.writableEnded) {
-        if (code !== 0 && !isComplete) {
+    subprocess.once("close", (code: number | null) => {
+      if (!isComplete && !res.writableEnded) {
+        if (code !== 0) {
           res.write(
             `data: ${JSON.stringify({
               error: {
@@ -238,7 +244,7 @@ async function handleStreamingResponse(
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      finish();
     });
 
     subprocess.start(prompt, { model, apiKey }).catch((err) => {
@@ -255,7 +261,7 @@ async function handleStreamingResponse(
         );
         res.end();
       }
-      resolve();
+      finish();
     });
   });
 }
@@ -277,16 +283,27 @@ async function handleNonStreamingResponse(
 
   const sendJson = (status: number, body: unknown): void => {
     if (res.writableEnded) return;
-    if (!res.headersSent) {
-      res.status(status).json(body);
-      return;
+    try {
+      if (!res.headersSent) {
+        res.status(status).json(body);
+        return;
+      }
+      // Headers already flushed — write body only (cannot call res.json/setHeader again).
+      if (status !== 200) {
+        console.error("[non-stream] Error after headers flushed:", body);
+      }
+      res.write(JSON.stringify(body));
+      res.end();
+    } catch (err) {
+      console.error("[non-stream] Failed to send response:", err);
+      if (!res.writableEnded) {
+        try {
+          res.end();
+        } catch {
+          /* ignore */
+        }
+      }
     }
-    // Headers already flushed — write body only (cannot call res.json/setHeader again).
-    if (status !== 200) {
-      console.error("[non-stream] Error after headers flushed:", body);
-    }
-    res.write(JSON.stringify(body));
-    res.end();
   };
 
   return new Promise<void>((resolve) => {
@@ -298,11 +315,11 @@ async function handleNonStreamingResponse(
       resolve();
     };
 
-    subprocess.on("result", (result: ResultEvent) => {
+    subprocess.once("result", (result: ResultEvent) => {
       finalResult = result;
     });
 
-    subprocess.on("error", (error: Error) => {
+    subprocess.once("error", (error: Error) => {
       console.error("[non-stream] Error:", error.message);
       sendJson(500, {
         error: { message: error.message, type: "server_error", code: null },
@@ -310,7 +327,7 @@ async function handleNonStreamingResponse(
       finish();
     });
 
-    subprocess.on("close", () => {
+    subprocess.once("close", () => {
       if (finalResult) {
         const response = createChatResponse(
           requestId,
