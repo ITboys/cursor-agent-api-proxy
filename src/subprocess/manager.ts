@@ -23,6 +23,11 @@ import {
 
 const IS_WIN = process.platform === "win32";
 const DEFAULT_TIMEOUT = 300_000; // 5 minutes
+/** Brief settle after spawn — agent init happens on first prompt, not at spawn. */
+const PREWARM_SETTLE_MS = Math.max(
+  0,
+  parseInt(process.env.CURSOR_PREWARM_SETTLE_MS ?? "500", 10) || 500
+);
 const DEBUG = !!process.env.CURSOR_DEBUG;
 
 export interface SubprocessOptions {
@@ -30,6 +35,8 @@ export interface SubprocessOptions {
   apiKey?: string;
   cwd?: string;
   timeout?: number;
+  /** Skip post-spawn settle (used for on-demand cold acquire). */
+  skipSettle?: boolean;
 }
 
 export interface ContentDeltaEvent {
@@ -77,8 +84,6 @@ export class CursorSubprocess extends EventEmitter {
   async preSpawn(options: SubprocessOptions): Promise<void> {
     if (this.process) return; // already spawned
 
-    const timeout = options.timeout ?? DEFAULT_TIMEOUT;
-
     return new Promise<void>((resolve, reject) => {
       try {
         const env = { ...process.env };
@@ -94,13 +99,8 @@ export class CursorSubprocess extends EventEmitter {
           shell: IS_WIN,
         });
 
-        this.timeoutId = setTimeout(() => {
-          if (!this.isKilled) {
-            this.isKilled = true;
-            this.process?.kill(IS_WIN ? undefined : "SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
-          }
-        }, timeout);
+        // No request timeout while warm — idle pre-spawned processes must not
+        // be killed after 5 min (was causing cold starts and pool stat drift).
 
         this.process.on("error", (err) => {
           this.clearTimer();
@@ -146,7 +146,20 @@ export class CursorSubprocess extends EventEmitter {
         });
 
         this.isWarm = true;
-        resolve();
+
+        // Brief settle so the OS finishes fork/exec; agent CLI init runs on first prompt.
+        const settleMs = options.skipSettle ? 0 : PREWARM_SETTLE_MS;
+        if (settleMs > 0) {
+          setTimeout(() => {
+            if (this.isKilled || !this.process || this.process.exitCode !== null) {
+              reject(new Error("Agent process exited during warm-up"));
+              return;
+            }
+            resolve();
+          }, settleMs).unref();
+        } else {
+          resolve();
+        }
       } catch (err) {
         this.clearTimer();
         reject(err);

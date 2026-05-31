@@ -15,6 +15,7 @@ import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   createStreamChunk,
   createDoneChunk,
+  createUsageChunk,
   createChatResponse,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
@@ -144,8 +145,9 @@ export async function handleChatCompletions(
       `[chat] id=${requestId} account=${accountId} model=${body.model} -> cli_model=${model} client_stream=${clientWantsStream}`
     );
 
-    // Acquire a subprocess from the pool (warm or cold)
-    const { subprocess } = await getPool().acquire(accountId, apiKey);
+    const t0 = Date.now();
+    const { subprocess, source } = await getPool().acquire(accountId, apiKey);
+    console.error(`[chat] id=${requestId} pool=${source} acquire_ms=${Date.now() - t0}`);
 
     if (clientWantsStream) {
       await handleStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
@@ -177,13 +179,17 @@ async function handleStreamingResponse(
   res.setHeader("X-Request-Id", requestId);
   res.flushHeaders();
 
-  res.write(":ok\n\n");
+  // SSE comment heartbeats help some clients; new-api Claude stream converter may
+  // fail to emit message_stop when upstream includes comment lines — omit for now.
+  // res.write(":ok\n\n");
 
   return new Promise<void>((resolve) => {
     let isFirst = true;
     let lastModel = model;
+    let streamedChars = 0;
     let isComplete = false;
     let settled = false;
+    const tStart = Date.now();
     const finish = () => {
       if (settled) return;
       settled = true;
@@ -197,6 +203,12 @@ async function handleStreamingResponse(
 
     subprocess.on("content_delta", (delta: ContentDeltaEvent) => {
       if (delta.text && !res.writableEnded) {
+        streamedChars += delta.text.length;
+        if (isFirst) {
+          console.error(
+            `[stream] id=${requestId} ttft_ms=${Date.now() - tStart}`
+          );
+        }
         const chunk = createStreamChunk(requestId, lastModel, delta.text, isFirst);
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         isFirst = false;
@@ -205,10 +217,19 @@ async function handleStreamingResponse(
 
     subprocess.once("result", (result: ResultEvent) => {
       isComplete = true;
-      if (result.model) lastModel = result.model;
+      // Keep request model id in the done chunk — CLI returns display names like
+      // "Auto" which breaks new-api's OpenAI→Claude stream converter (missing message_stop).
       if (!res.writableEnded) {
-        const done = createDoneChunk(requestId, lastModel);
+        const completionTokens = Math.max(
+          1,
+          Math.ceil((result.text || "").length / 3) || Math.ceil(streamedChars / 3)
+        );
+        const done = createDoneChunk(requestId, model);
         res.write(`data: ${JSON.stringify(done)}\n\n`);
+        // new-api defers message_stop until a usage-only SSE chunk arrives.
+        res.write(
+          `data: ${JSON.stringify(createUsageChunk(requestId, model, completionTokens))}\n\n`
+        );
         res.write("data: [DONE]\n\n");
         res.end();
       }

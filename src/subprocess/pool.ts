@@ -41,13 +41,14 @@ interface PoolEntry {
  */
 export class SubprocessPool {
   private pools = new Map<string, PoolEntry>();
+  private prewarmDone = false;
   private idleTimer: NodeJS.Timeout | null = null;
   private readonly IDLE_TTL = 5 * 60 * 1000; // 5 min — kill warm processes that never got used
   private readonly PREWARM_MODEL = "auto";
   /** Target warm processes to maintain per account (override via CURSOR_POOL_SIZE). */
   private readonly TARGET_SIZE = Math.max(
     1,
-    parseInt(process.env.CURSOR_POOL_SIZE ?? "3", 10) || 3
+    parseInt(process.env.CURSOR_POOL_SIZE ?? "2", 10) || 2
   );
 
   /**
@@ -89,9 +90,10 @@ export class SubprocessPool {
     }
 
     await Promise.all(promises);
+    this.prewarmDone = true;
 
     const stats = this.stats();
-    const warmCount = Object.values(stats).reduce((s, e) => s + e.warm, 0);
+    const warmCount = Object.values(stats).reduce((s, e) => s + e.alive, 0);
     console.error(`[Pool] ${warmCount} warm process(es) ready (target ${this.TARGET_SIZE} per account)`);
 
     // Start idle reaper
@@ -109,13 +111,17 @@ export class SubprocessPool {
   async acquire(accountId: string, apiKey?: string): Promise<{ subprocess: CursorSubprocess; source: "warm" | "cold" | "replacement" }> {
     let entry = this.pools.get(accountId);
 
-    // Try warm queue first
-    if (entry && entry.queue.length > 0) {
+    // Try warm queue first — skip dead/stale entries
+    while (entry && entry.queue.length > 0) {
       const sub = entry.queue.pop()!;
-      // Refill pool to TARGET_SIZE
-      this.refill(accountId, apiKey);
-      console.error(`[Pool] Acquired warm for '${accountId}' (${entry.queue.length} remain, refilling to ${this.TARGET_SIZE})`);
-      return { subprocess: sub, source: "warm" };
+      if (sub.isWarmProcess() && sub.isRunning()) {
+        this.refill(accountId, apiKey);
+        console.error(
+          `[Pool] Acquired warm for '${accountId}' (${entry.queue.length} remain, refilling to ${this.TARGET_SIZE})`
+        );
+        return { subprocess: sub, source: "warm" };
+      }
+      console.error(`[Pool] Discarded stale warm process for '${accountId}'`);
     }
 
     // Cold start — spawn now (first request for this account or pool exhausted)
@@ -124,6 +130,7 @@ export class SubprocessPool {
     await sub.preSpawn({
       model: this.PREWARM_MODEL,
       apiKey,
+      skipSettle: true,
     });
 
     // Ensure entry exists for future refilling
@@ -143,13 +150,16 @@ export class SubprocessPool {
    * Runs asynchronously — doesn't block the caller.
    */
   private refill(accountId: string, apiKey?: string): void {
+    if (!this.prewarmDone) return;
+
     let entry = this.pools.get(accountId);
     if (!entry) {
       entry = { queue: [], spawning: 0 };
       this.pools.set(accountId, entry);
     }
 
-    const needed = this.TARGET_SIZE - entry.queue.length - entry.spawning;
+    const alive = entry.queue.filter((s) => s.isWarmProcess() && s.isRunning()).length;
+    const needed = this.TARGET_SIZE - alive - entry.spawning;
     for (let i = 0; i < needed; i++) {
       entry.spawning++;
       this.spawnWarm(accountId, apiKey).finally(() => {
@@ -183,6 +193,19 @@ export class SubprocessPool {
         this.pools.set(accountId, entry);
       }
 
+      // Cap queue size — concurrent prewarm + refill can overshoot TARGET_SIZE.
+      if (entry.queue.length >= this.TARGET_SIZE) {
+        sub.kill();
+        return;
+      }
+
+      const alive = entry.queue.filter((s) => s.isWarmProcess() && s.isRunning()).length;
+      if (alive >= this.TARGET_SIZE) {
+        sub.kill();
+        return;
+      }
+
+      this.trackWarmProcess(accountId, sub);
       entry.queue.push(sub);
     } catch (err) {
       // Spawn failure (CLI not found, OOM, etc.) — log and move on
@@ -209,6 +232,7 @@ export class SubprocessPool {
    * Kill all warm processes and shut down the pool.
    */
   shutdown(): void {
+    this.prewarmDone = false;
     for (const [, entry] of this.pools) {
       for (const sub of entry.queue) {
         sub.kill();
@@ -222,12 +246,37 @@ export class SubprocessPool {
     }
   }
 
+  /** Drop a warm subprocess from the queue when it exits unexpectedly. */
+  private trackWarmProcess(accountId: string, sub: CursorSubprocess): void {
+    const onDead = () => {
+      sub.removeListener("close", onDead);
+      sub.removeListener("error", onDead);
+      const entry = this.pools.get(accountId);
+      if (!entry) return;
+      const idx = entry.queue.indexOf(sub);
+      if (idx >= 0) {
+        entry.queue.splice(idx, 1);
+        console.error(
+          `[Pool] Warm process for '${accountId}' exited early (${entry.queue.length} remain)`
+        );
+        this.refill(accountId);
+      }
+    };
+    sub.once("close", onDead);
+    sub.once("error", onDead);
+  }
+
   /** Get pool stats for health check / monitoring. */
-  stats(): Record<string, { warm: number; spawning: number; targetSize: number }> {
-    const stats: Record<string, { warm: number; spawning: number; targetSize: number }> = {};
+  stats(): Record<string, { warm: number; alive: number; spawning: number; targetSize: number }> {
+    const stats: Record<
+      string,
+      { warm: number; alive: number; spawning: number; targetSize: number }
+    > = {};
     for (const [id, entry] of this.pools) {
+      const alive = entry.queue.filter((s) => s.isWarmProcess() && s.isRunning()).length;
       stats[id] = {
         warm: entry.queue.length,
+        alive,
         spawning: entry.spawning,
         targetSize: this.TARGET_SIZE,
       };
