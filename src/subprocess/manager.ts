@@ -20,9 +20,12 @@ import {
   isToolCallMessage,
   isResultMessage,
 } from "../types/cursor-cli.js";
+import { IdleTimeout } from "./idle-timeout.js";
 
 const IS_WIN = process.platform === "win32";
+/** Idle wall-clock limit; renewed on any stdout activity during a request. */
 const DEFAULT_TIMEOUT = 900_000; // 15 minutes
+
 /** Brief settle after spawn — agent init happens on first prompt, not at spawn. */
 const PREWARM_SETTLE_MS = Math.max(
   0,
@@ -58,7 +61,8 @@ const MAX_TURNS = 5;
 export class CursorSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer = "";
-  private timeoutId: NodeJS.Timeout | null = null;
+  private idleTimeout: IdleTimeout | null = null;
+  private requestTimeoutMs = DEFAULT_TIMEOUT;
   private isKilled = false;
   private detectedModel = "cursor-auto";
   private turnBuffer = "";
@@ -117,8 +121,11 @@ export class CursorSubprocess extends EventEmitter {
           }
         });
 
-        // Set up stdout handler for streaming response parsing
+        // Set up stdout handler for streaming response parsing.
+        // Any stdout activity renews the idle timeout so long-running
+        // agents (tools / thinking) are not killed while still producing output.
         this.process.stdout?.on("data", (chunk: Buffer) => {
+          this.touchActivity();
           this.stdoutBuffer += chunk.toString();
           this.buffer += chunk.toString();
           this.processBuffer();
@@ -214,22 +221,40 @@ export class CursorSubprocess extends EventEmitter {
     // Cold path: original full spawn + write
     this.turnCount = 1;
     await this.preSpawn(options);
+    this.resetTimer(options.timeout);
     this.process!.stdin?.write(prompt);
     this.process!.stdin?.end();
     this.isWarm = false;
   }
 
-  /** Reset the timeout timer (used when switching from warm to active). */
+  /**
+   * Arm / renew the idle timeout for an active request.
+   * Timer starts when switching from warm→active (or cold start),
+   * and renews on stdout activity via touchActivity().
+   */
   private resetTimer(timeout?: number): void {
-    this.clearTimer();
-    const ttl = timeout ?? DEFAULT_TIMEOUT;
-    this.timeoutId = setTimeout(() => {
+    if (timeout !== undefined) {
+      this.requestTimeoutMs = timeout;
+    }
+    const ttl = this.requestTimeoutMs;
+    this.idleTimeout?.clear();
+    this.idleTimeout = new IdleTimeout(ttl, () => {
       if (!this.isKilled) {
         this.isKilled = true;
         this.process?.kill(IS_WIN ? undefined : "SIGTERM");
-        this.emit("error", new Error(`Request timed out after ${ttl}ms`));
+        this.emit(
+          "error",
+          new Error(`Request timed out after ${ttl}ms of inactivity`)
+        );
       }
-    }, ttl);
+    });
+    this.idleTimeout.touch();
+  }
+
+  /** Renew idle deadline while a request is active and producing output. */
+  private touchActivity(): void {
+    if (this.isKilled || this.isWarm || !this.idleTimeout?.armed) return;
+    this.idleTimeout.touch();
   }
 
   private buildArgs(options: SubprocessOptions): string[] {
@@ -313,10 +338,8 @@ export class CursorSubprocess extends EventEmitter {
   }
 
   private clearTimer(): void {
-    if (this.timeoutId) {
-      clearTimeout(this.timeoutId);
-      this.timeoutId = null;
-    }
+    this.idleTimeout?.clear();
+    this.idleTimeout = null;
   }
 
   kill(): void {
