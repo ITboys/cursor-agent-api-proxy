@@ -24,7 +24,6 @@ import type { OpenAIChatRequest } from "../types/openai.js";
 import { getAccountsManager } from "../account/manager.js";
 import { KNOWN_MODELS, isModelAllowed } from "../models/catalog.js";
 import { getRequestMetrics } from "./metrics.js";
-import type { PoolSource } from "./metrics.js";
 
 /** Multi-instance mode: bind this process to a single account (set by manager script). */
 const INSTANCE_ACCOUNT = process.env.CURSOR_INSTANCE_ACCOUNT;
@@ -98,6 +97,7 @@ export async function handleChatCompletions(
   // Default to streaming for faster first-byte delivery (OpenAI SDK default is false).
   const clientWantsStream = body.stream !== false;
   const accountId = resolveAccountId(req);
+  let begun = false;
 
   try {
     if (
@@ -137,34 +137,26 @@ export async function handleChatCompletions(
     const t0 = Date.now();
     const { subprocess, source } = await getPool().acquire(accountId, apiKey, model);
     console.error(`[chat] id=${requestId} pool=${source} acquire_ms=${Date.now() - t0}`);
+    // Count reqs / acquire immediately so in-flight work shows up in /v1/metrics.
+    getRequestMetrics().beginChat(source);
+    begun = true;
     res.setHeader("X-Pool-Source", source);
     res.setHeader("X-Request-Id", requestId);
 
     if (clientWantsStream) {
-      await handleStreamingResponse(
-        res,
-        subprocess,
-        prompt,
-        model,
-        requestId,
-        apiKey,
-        source
-      );
+      await handleStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
     } else {
-      await handleNonStreamingResponse(
-        res,
-        subprocess,
-        prompt,
-        model,
-        requestId,
-        apiKey,
-        source
-      );
+      await handleNonStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[chat] Error:", message);
-    getRequestMetrics().recordChat({ pool: "cold", ok: false });
+    // acquire 失败：整段记一次；已 begin 后失败：只 finish，避免双计 reqs/acquire
+    if (begun) {
+      getRequestMetrics().finishChat({ ok: false });
+    } else {
+      getRequestMetrics().recordChat({ pool: "cold", ok: false });
+    }
     if (!res.headersSent) {
       res
         .status(500)
@@ -179,8 +171,7 @@ async function handleStreamingResponse(
   prompt: string,
   model: string,
   requestId: string,
-  apiKey: string | undefined,
-  poolSource: PoolSource
+  apiKey: string | undefined
 ): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -203,7 +194,7 @@ async function handleStreamingResponse(
     const finish = () => {
       if (settled) return;
       settled = true;
-      getRequestMetrics().recordChat({ pool: poolSource, ttftMs, ok });
+      getRequestMetrics().finishChat({ ttftMs, ok });
       resolve();
     };
 
@@ -309,8 +300,7 @@ async function handleNonStreamingResponse(
   prompt: string,
   model: string,
   requestId: string,
-  apiKey: string | undefined,
-  poolSource: PoolSource
+  apiKey: string | undefined
 ): Promise<void> {
   // Flush headers immediately so clients (new-api, curl) see TTFB ~ms not ~10s.
   res.status(200);
@@ -351,7 +341,7 @@ async function handleNonStreamingResponse(
     const finish = (ttftMs?: number) => {
       if (settled) return;
       settled = true;
-      getRequestMetrics().recordChat({ pool: poolSource, ttftMs, ok });
+      getRequestMetrics().finishChat({ ttftMs, ok });
       resolve();
     };
 
@@ -508,6 +498,7 @@ export function handleMetrics(_req: Request, res: Response): void {
     warm_pool: getPool().stats(),
     requests: snap.requests,
     errors: snap.errors,
+    in_flight: snap.in_flight,
     acquire: snap.pool,
     ttft: snap.ttft,
     last_request_at: snap.last_request_at,
