@@ -12,44 +12,95 @@
  *   start:     write prompt to warm process's stdin → near-instant
  *   complete:  process exits naturally, replacement is already warming
  *
- * With TARGET_SIZE=2 and 2 accounts, the pool maintains 4 warm processes
- * at steady state, ensuring consecutive requests never hit a cold start.
+ * Warm slots always use PREWARM_MODEL ("auto"). Requests for a specific
+ * model cold-start so `--model` matches. Idle warm processes are reaped
+ * after IDLE_TTL and are NOT auto-refilled (next request cold-starts then refills).
  */
 
 import { CursorSubprocess, SubprocessOptions } from "./manager.js";
-import type { AccountConfig } from "../types/account.js";
 import { getAccountsManager } from "../account/manager.js";
+import {
+  PREWARM_MODEL,
+  canUseWarmPool,
+  resolveAcquireModel,
+  shouldPoolAccount,
+  shouldReapWarm,
+} from "./pool-policy.js";
+
+interface WarmItem {
+  sub: CursorSubprocess;
+  /** Wall-clock ms when this process entered (or re-entered) the warm queue. */
+  idleSince: number;
+}
 
 interface PoolEntry {
-  /** Queue of warm subprocesses ready to accept a prompt. */
-  queue: CursorSubprocess[];
+  queue: WarmItem[];
   /** In-flight spawn count — prevents over/under refill under burst load. */
   spawning: number;
+}
+
+export interface PoolAccountResolver {
+  list: () => { id: string }[];
+  hasAccounts: () => boolean;
+  resolveApiKey: (id?: string) => string | undefined;
+  get: (id: string) => unknown;
+}
+
+export interface PoolDeps {
+  idleTtlMs?: number;
+  targetSize?: number;
+  now?: () => number;
+  createSubprocess?: () => CursorSubprocess;
+  resolveAccounts?: () => PoolAccountResolver;
+  /** Multi-instance binding — only warm this account when set. */
+  instanceAccount?: string | null;
 }
 
 /**
  * Per-account process pool.
  *
  * Thread safety: Node.js is single-threaded, so no mutex needed.
- * The warm queue is just an array — push/pop are synchronous.
- *
- * Edge cases handled:
- * - Queue underflow: spawn synchronously, caller waits for first process
- * - Rapid concurrent requests: pool creates extras on demand (not limited by targetSize)
- * - Server shutdown: kill all warm processes
- * - Account deleted mid-flight: orphaned warm processes get cleaned up by idle TTL
  */
 export class SubprocessPool {
   private pools = new Map<string, PoolEntry>();
   private prewarmDone = false;
   private idleTimer: NodeJS.Timeout | null = null;
-  private readonly IDLE_TTL = 5 * 60 * 1000; // 5 min — kill warm processes that never got used
-  private readonly PREWARM_MODEL = "auto";
-  /** Target warm processes to maintain per account (override via CURSOR_POOL_SIZE). */
-  private readonly TARGET_SIZE = Math.max(
-    1,
-    parseInt(process.env.CURSOR_POOL_SIZE ?? "2", 10) || 2
-  );
+
+  private readonly IDLE_TTL: number;
+  private readonly TARGET_SIZE: number;
+  private readonly now: () => number;
+  private readonly createSubprocess: () => CursorSubprocess;
+  private readonly resolveAccounts: () => PoolAccountResolver;
+  private readonly instanceAccount: string | null;
+
+  constructor(deps: PoolDeps = {}) {
+    this.IDLE_TTL =
+      deps.idleTtlMs ??
+      Math.max(
+        60_000,
+        parseInt(process.env.CURSOR_POOL_IDLE_TTL_MS ?? "", 10) || 5 * 60 * 1000
+      );
+    this.TARGET_SIZE =
+      deps.targetSize ??
+      Math.max(1, parseInt(process.env.CURSOR_POOL_SIZE ?? "2", 10) || 2);
+    this.now = deps.now ?? Date.now;
+    this.createSubprocess = deps.createSubprocess ?? (() => new CursorSubprocess());
+    this.resolveAccounts =
+      deps.resolveAccounts ??
+      (() => {
+        const mgr = getAccountsManager();
+        return {
+          list: () => mgr.list(),
+          hasAccounts: () => mgr.hasAccounts(),
+          resolveApiKey: (id?: string) => mgr.resolveApiKey(id),
+          get: (id: string) => mgr.get(id),
+        };
+      });
+    this.instanceAccount =
+      deps.instanceAccount !== undefined
+        ? deps.instanceAccount
+        : process.env.CURSOR_INSTANCE_ACCOUNT ?? null;
+  }
 
   /**
    * Pre-warm all configured accounts.
@@ -57,21 +108,22 @@ export class SubprocessPool {
    * Server should await this before printing "ready".
    */
   async prewarmAll(): Promise<void> {
-    const mgr = getAccountsManager();
-    const accounts = mgr.list();
+    const accounts = this.resolveAccounts();
+    const all = accounts.list();
 
-    if (accounts.length === 0) {
+    if (all.length === 0) {
       console.error(`[Pool] No accounts configured — skipping pre-warm`);
+      this.markReady();
       return;
     }
 
-    const instanceAccount = process.env.CURSOR_INSTANCE_ACCOUNT;
-    const accountsToWarm = instanceAccount
-      ? accounts.filter((a) => a.id === instanceAccount)
-      : accounts;
+    const accountsToWarm = this.instanceAccount
+      ? all.filter((a) => a.id === this.instanceAccount)
+      : all;
 
     if (accountsToWarm.length === 0) {
       console.error(`[Pool] No accounts to pre-warm`);
+      this.markReady();
       return;
     }
 
@@ -79,10 +131,9 @@ export class SubprocessPool {
       `[Pool] Pre-warming ${accountsToWarm.length} account(s) x ${this.TARGET_SIZE} processes... (this may take 10-30s)`
     );
 
-    // Spawn TARGET_SIZE processes per account
     const promises: Promise<void>[] = [];
     for (const account of accountsToWarm) {
-      const apiKey = mgr.resolveApiKey(account.id);
+      const apiKey = accounts.resolveApiKey(account.id);
       if (!apiKey) continue;
       for (let i = 0; i < this.TARGET_SIZE; i++) {
         promises.push(this.spawnWarm(account.id, apiKey));
@@ -90,59 +141,89 @@ export class SubprocessPool {
     }
 
     await Promise.all(promises);
-    this.prewarmDone = true;
+    this.markReady();
 
     const stats = this.stats();
     const warmCount = Object.values(stats).reduce((s, e) => s + e.alive, 0);
-    console.error(`[Pool] ${warmCount} warm process(es) ready (target ${this.TARGET_SIZE} per account)`);
+    console.error(
+      `[Pool] ${warmCount} warm process(es) ready (target ${this.TARGET_SIZE} per account, idle TTL ${this.IDLE_TTL}ms)`
+    );
+  }
 
-    // Start idle reaper
-    this.idleTimer = setInterval(() => this.reapIdle(), this.IDLE_TTL);
-    this.idleTimer.unref();
+  /** Mark pool ready for refill / idle reaper (also used by tests). */
+  markReady(): void {
+    this.prewarmDone = true;
+    if (!this.idleTimer) {
+      this.idleTimer = setInterval(() => this.reapIdle(), this.IDLE_TTL);
+      this.idleTimer.unref();
+    }
   }
 
   /**
-   * Acquire a warm subprocess for the given account.
+   * Acquire a subprocess for the given account.
    *
-   * - If a warm process is available, returns it immediately.
-   * - If not, spawns one on-demand (first request for this account = cold start).
-   * - In both cases, starts async replacement spawns to refill to TARGET_SIZE.
+   * - auto / empty model → prefer warm queue (spawned with PREWARM_MODEL)
+   * - specific model → always cold-start with that `--model` (does not drain warm)
+   * - unknown account ids (when accounts configured) → one-shot cold, no pool key
    */
-  async acquire(accountId: string, apiKey?: string): Promise<{ subprocess: CursorSubprocess; source: "warm" | "cold" | "replacement" }> {
-    let entry = this.pools.get(accountId);
+  async acquire(
+    accountId: string,
+    apiKey?: string,
+    model?: string
+  ): Promise<{ subprocess: CursorSubprocess; source: "warm" | "cold" | "replacement" }> {
+    const accounts = this.resolveAccounts();
+    const knownIds = new Set(accounts.list().map((a) => a.id));
+    const poolThis = shouldPoolAccount(accountId, knownIds, accounts.hasAccounts());
+    const useWarm = canUseWarmPool(model);
 
-    // Try warm queue first — skip dead/stale entries
-    while (entry && entry.queue.length > 0) {
-      const sub = entry.queue.pop()!;
-      if (sub.isWarmProcess() && sub.isRunning()) {
-        this.refill(accountId, apiKey);
-        console.error(
-          `[Pool] Acquired warm for '${accountId}' (${entry.queue.length} remain, refilling to ${this.TARGET_SIZE})`
-        );
-        return { subprocess: sub, source: "warm" };
+    if (useWarm && poolThis) {
+      let entry = this.pools.get(accountId);
+      while (entry && entry.queue.length > 0) {
+        const item = entry.queue.pop()!;
+        if (item.sub.isWarmProcess() && item.sub.isRunning()) {
+          this.refill(accountId, apiKey);
+          console.error(
+            `[Pool] Acquired warm for '${accountId}' (${entry.queue.length} remain, refilling to ${this.TARGET_SIZE})`
+          );
+          return { subprocess: item.sub, source: "warm" };
+        }
+        console.error(`[Pool] Discarded stale warm process for '${accountId}'`);
       }
-      console.error(`[Pool] Discarded stale warm process for '${accountId}'`);
     }
 
-    // Cold start — spawn now (first request for this account or pool exhausted)
-    console.error(`[Pool] Cold start for account '${accountId}' — no warm process available`);
-    const sub = new CursorSubprocess();
+    const acquireModel = resolveAcquireModel(model);
+    console.error(
+      `[Pool] Cold start for account '${accountId}' model=${acquireModel}${useWarm ? "" : " (non-auto)"}`
+    );
+    const sub = this.createSubprocess();
     await sub.preSpawn({
-      model: this.PREWARM_MODEL,
+      model: acquireModel,
       apiKey,
       skipSettle: true,
     });
 
-    // Ensure entry exists for future refilling
-    if (!entry) {
-      entry = { queue: [], spawning: 0 };
-      this.pools.set(accountId, entry);
+    if (poolThis) {
+      if (!this.pools.get(accountId)) {
+        this.pools.set(accountId, { queue: [], spawning: 0 });
+      }
+      this.refill(accountId, apiKey);
     }
 
-    // Refill pool to TARGET_SIZE
-    this.refill(accountId, apiKey);
-
     return { subprocess: sub, source: "cold" };
+  }
+
+  /**
+   * Ensure warm capacity for an account after CRUD upsert.
+   * No-op until prewarm finishes, or if account has no API key / wrong instance.
+   */
+  ensure(accountId: string): void {
+    if (!this.prewarmDone) return;
+    if (this.instanceAccount && accountId !== this.instanceAccount) return;
+    const accounts = this.resolveAccounts();
+    if (!accounts.get(accountId)) return;
+    const apiKey = accounts.resolveApiKey(accountId);
+    if (!apiKey) return;
+    this.refill(accountId, apiKey);
   }
 
   /**
@@ -158,7 +239,7 @@ export class SubprocessPool {
       this.pools.set(accountId, entry);
     }
 
-    const alive = entry.queue.filter((s) => s.isWarmProcess() && s.isRunning()).length;
+    const alive = entry.queue.filter((i) => i.sub.isWarmProcess() && i.sub.isRunning()).length;
     const needed = this.TARGET_SIZE - alive - entry.spawning;
     for (let i = 0; i < needed; i++) {
       entry.spawning++;
@@ -169,23 +250,16 @@ export class SubprocessPool {
     }
   }
 
-  /**
-   * Spawn a warm process for this account and add to pool.
-   * Runs asynchronously — doesn't block the caller.
-   */
   private async spawnWarm(accountId: string, apiKey?: string): Promise<void> {
     const apiKeyToUse = apiKey ?? this.resolveApiKey(accountId);
-    if (!apiKeyToUse) {
-      // Account without API key can't be pre-warmed
-      return;
-    }
+    if (!apiKeyToUse) return;
 
     try {
-      const sub = new CursorSubprocess();
+      const sub = this.createSubprocess();
       await sub.preSpawn({
-        model: this.PREWARM_MODEL,
+        model: PREWARM_MODEL,
         apiKey: apiKeyToUse,
-      });
+      } as SubprocessOptions);
 
       let entry = this.pools.get(accountId);
       if (!entry) {
@@ -193,49 +267,41 @@ export class SubprocessPool {
         this.pools.set(accountId, entry);
       }
 
-      // Cap queue size — concurrent prewarm + refill can overshoot TARGET_SIZE.
       if (entry.queue.length >= this.TARGET_SIZE) {
         sub.kill();
         return;
       }
 
-      const alive = entry.queue.filter((s) => s.isWarmProcess() && s.isRunning()).length;
+      const alive = entry.queue.filter((i) => i.sub.isWarmProcess() && i.sub.isRunning()).length;
       if (alive >= this.TARGET_SIZE) {
         sub.kill();
         return;
       }
 
       this.trackWarmProcess(accountId, sub);
-      entry.queue.push(sub);
+      entry.queue.push({ sub, idleSince: this.now() });
     } catch (err) {
-      // Spawn failure (CLI not found, OOM, etc.) — log and move on
-      // The next acquire will get a cold start and surface the error
       console.error(`[Pool] Failed to warm account '${accountId}':`, err);
     }
   }
 
-  /**
-   * Remove account from pool (when account is deleted).
-   * Kills any warm processes for this account.
-   */
+  /** Remove account from pool (when account is deleted). */
   remove(accountId: string): void {
     const entry = this.pools.get(accountId);
     if (!entry) return;
 
-    for (const sub of entry.queue) {
-      sub.kill();
+    for (const item of entry.queue) {
+      item.sub.kill();
     }
     this.pools.delete(accountId);
   }
 
-  /**
-   * Kill all warm processes and shut down the pool.
-   */
+  /** Kill all warm processes and shut down the pool. */
   shutdown(): void {
     this.prewarmDone = false;
     for (const [, entry] of this.pools) {
-      for (const sub of entry.queue) {
-        sub.kill();
+      for (const item of entry.queue) {
+        item.sub.kill();
       }
     }
     this.pools.clear();
@@ -246,14 +312,13 @@ export class SubprocessPool {
     }
   }
 
-  /** Drop a warm subprocess from the queue when it exits unexpectedly. */
   private trackWarmProcess(accountId: string, sub: CursorSubprocess): void {
     const onDead = () => {
       sub.removeListener("close", onDead);
       sub.removeListener("error", onDead);
       const entry = this.pools.get(accountId);
       if (!entry) return;
-      const idx = entry.queue.indexOf(sub);
+      const idx = entry.queue.findIndex((i) => i.sub === sub);
       if (idx >= 0) {
         entry.queue.splice(idx, 1);
         console.error(
@@ -266,14 +331,13 @@ export class SubprocessPool {
     sub.once("error", onDead);
   }
 
-  /** Get pool stats for health check / monitoring. */
   stats(): Record<string, { warm: number; alive: number; spawning: number; targetSize: number }> {
     const stats: Record<
       string,
       { warm: number; alive: number; spawning: number; targetSize: number }
     > = {};
     for (const [id, entry] of this.pools) {
-      const alive = entry.queue.filter((s) => s.isWarmProcess() && s.isRunning()).length;
+      const alive = entry.queue.filter((i) => i.sub.isWarmProcess() && i.sub.isRunning()).length;
       stats[id] = {
         warm: entry.queue.length,
         alive,
@@ -284,30 +348,74 @@ export class SubprocessPool {
     return stats;
   }
 
+  /** Run one idle-reap cycle (interval + tests). */
+  runIdleReaper(): void {
+    this.reapIdle();
+  }
+
   /**
-   * Kill warm processes that have been idle too long.
-   * Protects against memory leak if accounts are deleted without calling remove().
+   * Seed a warm slot without spawning (tests / recovery).
+   */
+  enqueueWarm(accountId: string, sub: CursorSubprocess, idleSince: number): void {
+    let entry = this.pools.get(accountId);
+    if (!entry) {
+      entry = { queue: [], spawning: 0 };
+      this.pools.set(accountId, entry);
+    }
+    this.trackWarmProcess(accountId, sub);
+    entry.queue.push({ sub, idleSince });
+  }
+
+  /**
+   * Kill warm processes idle longer than IDLE_TTL, and purge deleted accounts.
+   * Does NOT refill after idle reap — next request cold-starts then refills.
    */
   private reapIdle(): void {
-    const mgr = getAccountsManager();
-    const knownIds = new Set(mgr.list().map((a) => a.id));
+    const accounts = this.resolveAccounts();
+    const knownIds = new Set(accounts.list().map((a) => a.id));
+    const hasAccounts = accounts.hasAccounts();
+    const now = this.now();
 
     for (const [id, entry] of this.pools) {
-      if (!knownIds.has(id)) {
-        // Account no longer configured — purge
-        for (const sub of entry.queue) {
-          sub.kill();
+      if (hasAccounts && !knownIds.has(id)) {
+        for (const item of entry.queue) {
+          item.sub.kill();
         }
         this.pools.delete(id);
         console.error(`[Pool] Reaped stale warm processes for removed account '${id}'`);
+        continue;
+      }
+
+      const keep: WarmItem[] = [];
+      let reaped = 0;
+      for (const item of entry.queue) {
+        if (!item.sub.isWarmProcess() || !item.sub.isRunning()) {
+          continue;
+        }
+        if (shouldReapWarm(item.idleSince, now, this.IDLE_TTL)) {
+          item.sub.kill();
+          reaped++;
+          continue;
+        }
+        keep.push(item);
+      }
+      entry.queue = keep;
+
+      if (reaped > 0) {
+        console.error(
+          `[Pool] Reaped ${reaped} idle warm process(es) for '${id}' (TTL ${this.IDLE_TTL}ms)`
+        );
+      }
+
+      if (entry.queue.length === 0 && entry.spawning === 0) {
+        this.pools.delete(id);
       }
     }
   }
 
   private resolveApiKey(accountId: string): string | undefined {
     try {
-      const mgr = getAccountsManager();
-      return mgr.resolveApiKey(accountId);
+      return this.resolveAccounts().resolveApiKey(accountId);
     } catch {
       return undefined;
     }

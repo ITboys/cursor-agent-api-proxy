@@ -21,6 +21,7 @@ import {
   isResultMessage,
 } from "../types/cursor-cli.js";
 import { IdleTimeout } from "./idle-timeout.js";
+import { warmNeedsRespawn } from "./pool-policy.js";
 
 const IS_WIN = process.platform === "win32";
 /** Idle wall-clock limit; renewed on any stdout activity during a request. */
@@ -65,6 +66,8 @@ export class CursorSubprocess extends EventEmitter {
   private requestTimeoutMs = DEFAULT_TIMEOUT;
   private isKilled = false;
   private detectedModel = "cursor-auto";
+  /** Model passed to CLI at spawn (`--model`); warm pool uses "auto". */
+  private spawnedModel = "auto";
   private turnBuffer = "";
   private isWarm = false;
 
@@ -96,6 +99,7 @@ export class CursorSubprocess extends EventEmitter {
         }
 
         const args = this.buildArgs(options);
+        this.spawnedModel = options.model || "auto";
         this.process = spawn("agent", args, {
           cwd: options.cwd ?? process.cwd(),
           env,
@@ -104,7 +108,7 @@ export class CursorSubprocess extends EventEmitter {
         });
 
         // No request timeout while warm — idle pre-spawned processes must not
-        // be killed after 5 min (was causing cold starts and pool stat drift).
+        // be killed by the request idle timer (pool idle TTL handles that).
 
         this.process.on("error", (err) => {
           this.clearTimer();
@@ -201,10 +205,21 @@ export class CursorSubprocess extends EventEmitter {
       await this.preSpawn(options);
     }
 
+    if (this.isWarm && this.process && warmNeedsRespawn(this.spawnedModel, options.model)) {
+      // Warm path was spawned with a fixed --model (usually auto). If the
+      // request needs a different model, kill and respawn before writing.
+      console.error(
+        `[CursorSubprocess] Warm model mismatch spawned=${this.spawnedModel} want=${options.model} — respawning`
+      );
+      this.kill();
+      this.cleanup();
+      this.isWarm = false;
+      this.turnCount = 0;
+      await this.preSpawn(options);
+    }
+
     if (this.isWarm && this.process) {
-      // Warm path: already spawned, just write prompt and signal end
-      // We write the prompt then close stdin. The agent processes it and
-      // exits. For keep-alive, we rely on the pool to re-spawn.
+      // Warm path: already spawned with matching model — just write prompt.
       this.resetTimer(options.timeout);
       this.buffer = "";
       this.turnBuffer = "";
@@ -212,13 +227,12 @@ export class CursorSubprocess extends EventEmitter {
       this.stdoutBuffer = "";
       this.isWarm = false;
       this.turnCount++;
-
       this.process.stdin?.write(prompt);
       this.process.stdin?.end();
       return;
     }
 
-    // Cold path: original full spawn + write
+    // Cold path: full spawn + write
     this.turnCount = 1;
     await this.preSpawn(options);
     this.resetTimer(options.timeout);
@@ -369,6 +383,11 @@ export class CursorSubprocess extends EventEmitter {
     return this.isWarm && this.process !== null && !this.isKilled;
   }
 
+  /** Model used when this process was spawned (for pool / diagnostics). */
+  getSpawnedModel(): string {
+    return this.spawnedModel;
+  }
+
   /** Max turns this process can handle before recycle. */
   getMaxTurns(): number {
     return MAX_TURNS;
@@ -383,6 +402,7 @@ export class CursorSubprocess extends EventEmitter {
     this.turnBuffer = "";
     this.stdoutBuffer = "";
     this.detectedModel = "cursor-auto";
+    this.spawnedModel = "auto";
     this.isWarm = false;
     this.pendingResolve = null;
     this.pendingReject = null;

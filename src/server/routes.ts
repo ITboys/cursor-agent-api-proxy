@@ -146,7 +146,7 @@ export async function handleChatCompletions(
     );
 
     const t0 = Date.now();
-    const { subprocess, source } = await getPool().acquire(accountId, apiKey);
+    const { subprocess, source } = await getPool().acquire(accountId, apiKey, model);
     console.error(`[chat] id=${requestId} pool=${source} acquire_ms=${Date.now() - t0}`);
 
     if (clientWantsStream) {
@@ -498,21 +498,25 @@ export function handleUpsertAccount(req: Request, res: Response): void {
   }
 
   const mgr = getAccountsManager();
-  mgr.set(id.trim(), {
+  const accountId = id.trim();
+  mgr.set(accountId, {
     name: config.name,
     api_key: config.api_key,
     default: config.default === true,
     models: Array.isArray(config.models) ? config.models : undefined,
   });
 
+  // Pre-warm (or refill) so the new/updated account is ready for traffic.
+  getPool().ensure(accountId);
+
   res.status(200).json({
     object: "account",
-    id: id.trim(),
+    id: accountId,
     name: config.name,
-    default: config.default === true || id.trim() === mgr.getDefaultId(),
+    default: config.default === true || accountId === mgr.getDefaultId(),
     hasApiKey: !!config.api_key,
     modelCount: Array.isArray(config.models) ? config.models.length : null,
-    message: `Account '${id.trim()}' saved.`,
+    message: `Account '${accountId}' saved.`,
   });
 }
 
@@ -544,6 +548,8 @@ export function handleDeleteAccount(req: Request, res: Response): void {
   }
 
   mgr.remove(id);
+  // Kill warm processes immediately — don't wait for idle reap of ghost keys.
+  getPool().remove(id);
   res.json({
     object: "account",
     id,
