@@ -50,6 +50,26 @@ export function createDoneChunk(
   };
 }
 
+/** Usage-only chunk — new-api Claude stream converter waits for this before message_stop. */
+export function createUsageChunk(
+  requestId: string,
+  model: string,
+  completionTokens: number
+): Record<string, unknown> {
+  return {
+    id: `chatcmpl-${requestId}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: completionTokens,
+      total_tokens: completionTokens,
+    },
+  };
+}
+
 export function createChatResponse(
   requestId: string,
   model: string,
