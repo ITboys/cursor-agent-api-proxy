@@ -22,7 +22,7 @@ import {
 } from "../types/cursor-cli.js";
 
 const IS_WIN = process.platform === "win32";
-const DEFAULT_TIMEOUT = 300_000; // 5 minutes
+const DEFAULT_TIMEOUT = 900_000; // 15 minutes
 /** Brief settle after spawn — agent init happens on first prompt, not at spawn. */
 const PREWARM_SETTLE_MS = Math.max(
   0,
