@@ -159,6 +159,11 @@ export class SubprocessPool {
     }
   }
 
+  /** True after prewarm finishes (or skips). Used by /ready. */
+  isReady(): boolean {
+    return this.prewarmDone;
+  }
+
   /**
    * Acquire a subprocess for the given account.
    *

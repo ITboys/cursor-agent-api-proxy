@@ -113,7 +113,8 @@ Full list: `curl http://localhost:4646/v1/models` or `agent --list-models`.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check |
+| `/health` | GET | Liveness check (always 200 while listening; includes `ready`) |
+| `/ready` | GET | Readiness — 200 after warm prewarm, 503 while warming |
 | `/v1/models` | GET | List models |
 | `/v1/chat/completions` | POST | Chat completion (supports `stream: true`) |
 
@@ -271,7 +272,8 @@ curl http://localhost:4646/health
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check (includes account info) |
+| `/health` | GET | Liveness (includes account info + `ready`) |
+| `/ready` | GET | Warm-pool readiness (200 / 503) |
 | `/v1/models` | GET | List models |
 | `/v1/chat/completions` | POST | Chat completion (supports `stream: true`) |
 | `/v1/accounts` | GET | List all accounts |

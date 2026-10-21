@@ -11,6 +11,7 @@ import { v4 as uuidv4 } from "uuid";
 import { CursorSubprocess } from "../subprocess/manager.js";
 import type { ContentDeltaEvent, ResultEvent } from "../subprocess/manager.js";
 import { getPool } from "../subprocess/pool.js";
+import { buildReadyBody, readyHttpStatus } from "../subprocess/ready.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   createStreamChunk,
@@ -436,6 +437,8 @@ export function handleHealth(_req: Request, res: Response): void {
   const activeAccount = INSTANCE_ACCOUNT ?? mgr.getDefaultId();
   const activeId = activeAccount ?? "agent-login";
   const accounts = mgr.list(activeAccount);
+  const pool = getPool();
+  const ready = pool.isReady();
 
   const accountsBlock: Record<string, unknown> = {
     total: accounts.length,
@@ -448,16 +451,26 @@ export function handleHealth(_req: Request, res: Response): void {
     accountsBlock.default = activeId;
   }
 
+  // Liveness: always 200 once the process is listening.
+  // Readiness for LB / rolling restart lives on GET /ready.
   res.json({
     status: "ok",
+    ready,
     provider: "cursor-agent-api-proxy",
     cli_version: cachedCliVersion ?? "unknown",
     active_account: activeId,
     instance_account: INSTANCE_ACCOUNT ?? null,
     accounts: accountsBlock,
-    pool: getPool().stats(),
+    pool: pool.stats(),
     timestamp: new Date().toISOString(),
   });
+}
+
+/** GET /ready — 200 after warm prewarm; 503 while still warming. */
+export function handleReady(_req: Request, res: Response): void {
+  const pool = getPool();
+  const ready = pool.isReady();
+  res.status(readyHttpStatus(ready)).json(buildReadyBody(ready, pool.stats()));
 }
 
 // ── Account management endpoints ──────────────────────────────────────

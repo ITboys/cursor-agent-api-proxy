@@ -158,6 +158,7 @@ export function daemonStart(port?: number): void {
   │  Status   : running (pid: ${String(child.pid).padEnd(14)}│
   │  Base URL : ${(base + "/v1").padEnd(29)}│
   │  Health   : ${(base + "/health").padEnd(29)}│
+  │  Ready    : ${(base + "/ready").padEnd(29)}│
   │  Logs     : ~/.cursor-agent-api/server.log│
   │                                           │
   │  Stop     : cursor-agent-api stop         │

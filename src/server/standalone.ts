@@ -98,6 +98,7 @@ async function runForeground(port: number): Promise<void> {
     const base = `http://localhost:${port}`;
     console.log(`\n  Base URL : ${base}/v1`);
     console.log(`  Health   : ${base}/health`);
+    console.log(`  Ready    : ${base}/ready`);
     console.log(`  Accounts : ${base}/v1/accounts`);
     console.log("\n  Headers for multi-account: X-Cursor-Account: <account-id>");
     console.log("  Press Ctrl+C to stop.\n");

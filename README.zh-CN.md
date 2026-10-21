@@ -113,7 +113,8 @@ gemini-3-pro          # Gemini 3 Pro
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/health` | GET | 健康检查 |
+| `/health` | GET | 存活检查（监听即 200，含 `ready`） |
+| `/ready` | GET | 就绪检查 — 预热完成 200，预热中 503 |
 | `/v1/models` | GET | 模型列表 |
 | `/v1/chat/completions` | POST | 聊天补全（支持 `stream: true`） |
 
@@ -271,7 +272,8 @@ curl http://localhost:4646/health
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/health` | GET | 健康检查（含账号信息） |
+| `/health` | GET | 存活检查（含账号信息 + `ready`） |
+| `/ready` | GET | 暖池就绪（200 / 503） |
 | `/v1/models` | GET | 模型列表 |
 | `/v1/chat/completions` | POST | 聊天补全（支持 `stream: true`） |
 | `/v1/accounts` | GET | 列出所有账号 |

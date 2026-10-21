@@ -8,6 +8,7 @@ import {
   handleChatCompletions,
   handleModels,
   handleHealth,
+  handleReady,
   handleRoot,
   handlePostRoot,
   handleListAccounts,
@@ -53,6 +54,7 @@ export async function startServer(
   app.post("/", handlePostRoot);
   app.get("/health", handleHealth);
   app.post("/health", handleHealth);
+  app.get("/ready", handleReady);
   app.get("/v1/models", handleModels);
   app.post("/v1/chat/completions", handleChatCompletions);
 
