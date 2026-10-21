@@ -19,40 +19,15 @@ import {
   createUsageChunk,
   createChatResponse,
 } from "../adapter/cli-to-openai.js";
+import { resolveResponseModel } from "../adapter/response-model.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
 import { getAccountsManager } from "../account/manager.js";
+import { KNOWN_MODELS, isModelAllowed } from "../models/catalog.js";
+import { getRequestMetrics } from "./metrics.js";
+import type { PoolSource } from "./metrics.js";
 
 /** Multi-instance mode: bind this process to a single account (set by manager script). */
 const INSTANCE_ACCOUNT = process.env.CURSOR_INSTANCE_ACCOUNT;
-
-const KNOWN_MODELS = [
-  "auto",
-  "composer-1.5",
-  "composer-1",
-  "opus-4.6-thinking",
-  "opus-4.6",
-  "opus-4.5-thinking",
-  "opus-4.5",
-  "sonnet-4.5-thinking",
-  "sonnet-4.5",
-  "gpt-5.3-codex",
-  "gpt-5.3-codex-fast",
-  "gpt-5.3-codex-low",
-  "gpt-5.3-codex-low-fast",
-  "gpt-5.3-codex-high",
-  "gpt-5.3-codex-high-fast",
-  "gpt-5.3-codex-xhigh",
-  "gpt-5.3-codex-xhigh-fast",
-  "gpt-5.3-codex-spark-preview",
-  "gpt-5.2",
-  "gpt-5.2-codex",
-  "gpt-5.2-codex-low",
-  "gpt-5.2-codex-low-fast",
-  "gpt-5.1-codex-max",
-  "gemini-3-pro",
-  "gemini-3-flash",
-  "grok",
-];
 
 /**
  * Extract API key from request:
@@ -141,6 +116,19 @@ export async function handleChatCompletions(
     }
 
     const { prompt, model } = openaiToCli(body);
+
+    const accountCfg = getAccountsManager().get(accountId);
+    if (accountCfg && !isModelAllowed(accountCfg.models, model)) {
+      res.status(403).json({
+        error: {
+          message: `Model '${model}' is not allowed for account '${accountId}'`,
+          type: "invalid_request_error",
+          code: "model_not_allowed",
+        },
+      });
+      return;
+    }
+
     const apiKey = resolveApiKey(req);
     console.error(
       `[chat] id=${requestId} account=${accountId} model=${body.model} -> cli_model=${model} client_stream=${clientWantsStream}`
@@ -149,15 +137,34 @@ export async function handleChatCompletions(
     const t0 = Date.now();
     const { subprocess, source } = await getPool().acquire(accountId, apiKey, model);
     console.error(`[chat] id=${requestId} pool=${source} acquire_ms=${Date.now() - t0}`);
+    res.setHeader("X-Pool-Source", source);
+    res.setHeader("X-Request-Id", requestId);
 
     if (clientWantsStream) {
-      await handleStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
+      await handleStreamingResponse(
+        res,
+        subprocess,
+        prompt,
+        model,
+        requestId,
+        apiKey,
+        source
+      );
     } else {
-      await handleNonStreamingResponse(res, subprocess, prompt, model, requestId, apiKey);
+      await handleNonStreamingResponse(
+        res,
+        subprocess,
+        prompt,
+        model,
+        requestId,
+        apiKey,
+        source
+      );
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[chat] Error:", message);
+    getRequestMetrics().recordChat({ pool: "cold", ok: false });
     if (!res.headersSent) {
       res
         .status(500)
@@ -172,12 +179,12 @@ async function handleStreamingResponse(
   prompt: string,
   model: string,
   requestId: string,
-  apiKey?: string
+  apiKey: string | undefined,
+  poolSource: PoolSource
 ): Promise<void> {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Request-Id", requestId);
   res.flushHeaders();
 
   // SSE comment heartbeats help some clients; new-api Claude stream converter may
@@ -186,19 +193,25 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve) => {
     let isFirst = true;
-    let lastModel = model;
+    const responseModel = resolveResponseModel(model);
     let streamedChars = 0;
     let isComplete = false;
     let settled = false;
+    let ttftMs: number | undefined;
+    let ok = true;
     const tStart = Date.now();
     const finish = () => {
       if (settled) return;
       settled = true;
+      getRequestMetrics().recordChat({ pool: poolSource, ttftMs, ok });
       resolve();
     };
 
     res.on("close", () => {
-      if (!isComplete) subprocess.kill();
+      if (!isComplete) {
+        ok = false;
+        subprocess.kill();
+      }
       finish();
     });
 
@@ -206,11 +219,10 @@ async function handleStreamingResponse(
       if (delta.text && !res.writableEnded) {
         streamedChars += delta.text.length;
         if (isFirst) {
-          console.error(
-            `[stream] id=${requestId} ttft_ms=${Date.now() - tStart}`
-          );
+          ttftMs = Date.now() - tStart;
+          console.error(`[stream] id=${requestId} ttft_ms=${ttftMs}`);
         }
-        const chunk = createStreamChunk(requestId, lastModel, delta.text, isFirst);
+        const chunk = createStreamChunk(requestId, responseModel, delta.text, isFirst);
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         isFirst = false;
       }
@@ -225,11 +237,11 @@ async function handleStreamingResponse(
           1,
           Math.ceil((result.text || "").length / 3) || Math.ceil(streamedChars / 3)
         );
-        const done = createDoneChunk(requestId, model);
+        const done = createDoneChunk(requestId, responseModel);
         res.write(`data: ${JSON.stringify(done)}\n\n`);
         // new-api defers message_stop until a usage-only SSE chunk arrives.
         res.write(
-          `data: ${JSON.stringify(createUsageChunk(requestId, model, completionTokens))}\n\n`
+          `data: ${JSON.stringify(createUsageChunk(requestId, responseModel, completionTokens))}\n\n`
         );
         res.write("data: [DONE]\n\n");
         res.end();
@@ -238,6 +250,7 @@ async function handleStreamingResponse(
     });
 
     subprocess.once("error", (error: Error) => {
+      ok = false;
       console.error("[stream] Error:", error.message);
       if (!res.writableEnded) {
         res.write(
@@ -253,6 +266,7 @@ async function handleStreamingResponse(
     subprocess.once("close", (code: number | null) => {
       if (!isComplete && !res.writableEnded) {
         if (code !== 0) {
+          ok = false;
           res.write(
             `data: ${JSON.stringify({
               error: {
@@ -270,6 +284,7 @@ async function handleStreamingResponse(
     });
 
     subprocess.start(prompt, { model, apiKey }).catch((err) => {
+      ok = false;
       console.error("[stream] Start error:", err);
       if (!res.writableEnded) {
         res.write(
@@ -294,12 +309,12 @@ async function handleNonStreamingResponse(
   prompt: string,
   model: string,
   requestId: string,
-  apiKey?: string
+  apiKey: string | undefined,
+  poolSource: PoolSource
 ): Promise<void> {
   // Flush headers immediately so clients (new-api, curl) see TTFB ~ms not ~10s.
   res.status(200);
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("X-Request-Id", requestId);
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
@@ -331,9 +346,12 @@ async function handleNonStreamingResponse(
   return new Promise<void>((resolve) => {
     let finalResult: ResultEvent | null = null;
     let settled = false;
-    const finish = () => {
+    let ok = true;
+    const tStart = Date.now();
+    const finish = (ttftMs?: number) => {
       if (settled) return;
       settled = true;
+      getRequestMetrics().recordChat({ pool: poolSource, ttftMs, ok });
       resolve();
     };
 
@@ -342,6 +360,7 @@ async function handleNonStreamingResponse(
     });
 
     subprocess.once("error", (error: Error) => {
+      ok = false;
       console.error("[non-stream] Error:", error.message);
       sendJson(500, {
         error: { message: error.message, type: "server_error", code: null },
@@ -351,13 +370,16 @@ async function handleNonStreamingResponse(
 
     subprocess.once("close", () => {
       if (finalResult) {
+        const responseModel = resolveResponseModel(model, finalResult.model);
         const response = createChatResponse(
           requestId,
-          finalResult.model || model,
+          responseModel,
           finalResult.text
         );
         sendJson(200, response);
+        finish(Date.now() - tStart);
       } else if (!settled) {
+        ok = false;
         sendJson(500, {
           error: {
             message: "CLI exited without producing a result",
@@ -365,11 +387,12 @@ async function handleNonStreamingResponse(
             code: null,
           },
         });
+        finish();
       }
-      finish();
     });
 
     subprocess.start(prompt, { model, apiKey }).catch((error) => {
+      ok = false;
       sendJson(500, {
         error: {
           message: error instanceof Error ? error.message : String(error),
@@ -471,6 +494,25 @@ export function handleReady(_req: Request, res: Response): void {
   const pool = getPool();
   const ready = pool.isReady();
   res.status(readyHttpStatus(ready)).json(buildReadyBody(ready, pool.stats()));
+}
+
+/** GET /v1/metrics — in-process request aggregates (per instance). */
+export function handleMetrics(_req: Request, res: Response): void {
+  const mgr = getAccountsManager();
+  const activeAccount = INSTANCE_ACCOUNT ?? mgr.getDefaultId() ?? "default";
+  const snap = getRequestMetrics().snapshot();
+  res.json({
+    object: "metrics",
+    account: activeAccount,
+    instance_account: INSTANCE_ACCOUNT ?? null,
+    warm_pool: getPool().stats(),
+    requests: snap.requests,
+    errors: snap.errors,
+    acquire: snap.pool,
+    ttft: snap.ttft,
+    last_request_at: snap.last_request_at,
+    timestamp: new Date().toISOString(),
+  });
 }
 
 // ── Account management endpoints ──────────────────────────────────────

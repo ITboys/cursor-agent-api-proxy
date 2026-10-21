@@ -9,6 +9,7 @@ import {
   handleModels,
   handleHealth,
   handleReady,
+  handleMetrics,
   handleRoot,
   handlePostRoot,
   handleListAccounts,
@@ -56,6 +57,7 @@ export async function startServer(
   app.post("/health", handleHealth);
   app.get("/ready", handleReady);
   app.get("/v1/models", handleModels);
+  app.get("/v1/metrics", handleMetrics);
   app.post("/v1/chat/completions", handleChatCompletions);
 
   // Account management endpoints
